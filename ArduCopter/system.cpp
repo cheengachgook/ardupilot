@@ -170,6 +170,9 @@ void Copter::init_ardupilot()
     custom_control.init();
 #endif
 
+#if AP_ESNCONTROLLER_ENABLED
+    attitude_control->esn_init();   // <<< ДОБАВЬТЕ ЭТУ СТРОКУ
+#endif
     // set landed flags
     set_land_complete(true);
     set_land_complete_maybe(true);

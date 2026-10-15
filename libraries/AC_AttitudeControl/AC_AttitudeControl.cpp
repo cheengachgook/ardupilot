@@ -3,6 +3,9 @@
 #include <AP_Vehicle/AP_Vehicle.h>
 #include <AP_Scheduler/AP_Scheduler.h>
 #include <AP_Vehicle/AP_Vehicle_Type.h>
+#if AP_ESNCONTROLLER_ENABLED
+    #include <AP_ESNController/ESNController.h>
+#endif
 
 extern const AP_HAL::HAL& hal;
 
@@ -275,6 +278,13 @@ void AC_AttitudeControl::reset_rate_controller_I_terms()
     get_rate_roll_pid().reset_I();
     get_rate_pitch_pid().reset_I();
     get_rate_yaw_pid().reset_I();
+    
+    #if AP_ESNCONTROLLER_ENABLED
+        _esn_roll.reset();      // <-- было _esn.reset();
+        _esn_pitch.reset();     // <-- новый
+        _prev_roll_error = 0;
+        _prev_pitch_error = 0;
+    #endif
 }
 
 // reset rate controller I terms smoothly to zero in 0.5 seconds
@@ -995,7 +1005,7 @@ void AC_AttitudeControl::attitude_controller_run_quat()
     // This vector represents the angular error to rotate the thrust vector using x and y and heading using z
     Vector3f attitude_error;
     thrust_heading_rotation_angles(_attitude_target, attitude_body, attitude_error, _thrust_angle_rad, _thrust_error_angle_rad);
-
+    
     // Compute the angular velocity corrections in the body frame from the attitude error
     Vector3f ang_vel_body_rads = update_ang_vel_target_from_att_error(attitude_error);
 
@@ -1022,6 +1032,126 @@ void AC_AttitudeControl::attitude_controller_run_quat()
         ang_vel_body_rads += ang_vel_body_feedforward;
     }
 
+    
+    #if AP_ESNCONTROLLER_ENABLED
+        const float dt = _dt_s;
+        float roll_error  = attitude_error.x;
+        float pitch_error = attitude_error.y;
+
+        float d_roll_error  = (roll_error  - _prev_roll_error)  / dt;
+        float d_pitch_error = (pitch_error - _prev_pitch_error) / dt;
+        _prev_roll_error  = roll_error;
+        _prev_pitch_error = pitch_error;
+
+        // I-составляющие по обеим осям (симметрия!)
+        float roll_integral  = get_rate_roll_pid().get_pid_info().I;
+        float pitch_integral = get_rate_pitch_pid().get_pid_info().I;
+
+        // Фактические угловые скорости
+        float roll_rate  = gyro.x;
+        float pitch_rate = gyro.y;
+        float yaw_rate   = gyro.z;
+
+        // Целевые угловые скорости
+        float target_roll_rate  = _ang_vel_target_rads.x;
+        float target_pitch_rate = _ang_vel_target_rads.y;
+
+        // Воздушная скорость (с fallback на groundspeed)
+        float airspeed = 0.0f;
+        const AP_Airspeed &aspeed = AP::airspeed();
+        if (aspeed.healthy()) {
+            airspeed = aspeed.get_airspeed();
+        } else {
+            airspeed = AP::ahrs().groundspeed();
+        }
+        if (!is_positive(airspeed)) {
+            airspeed = AP::ahrs().groundspeed();
+        }
+
+        // Высота относительно home
+        float alt = 0.0f;
+        _ahrs.get_relative_position_D_home(alt);
+
+        // Газ и общий угол ошибки ориентации
+        float throttle = _motors.get_throttle();
+        float thrust_err_angle = _thrust_error_angle_rad;
+
+        // ─── Вектор из 12 признаков для ESN по КРЕНУ ───
+        float features_roll[12] = {
+            roll_error,           // 1. своя ошибка
+            d_roll_error,         // 2. своя производная
+            roll_integral,        // 3. свой интеграл
+            roll_rate,            // 4. своя фактическая скорость
+            target_roll_rate,     // 5. своя целевая скорость
+            pitch_error,          // 6. соседняя ошибка (контекст)
+            pitch_rate,           // 7. соседняя скорость (контекст)
+            yaw_rate,             // 8. рыскание (связь осей)
+            airspeed,             // 9. воздушная скорость
+            alt,                  // 10. высота
+            throttle,             // 11. газ
+            thrust_err_angle      // 12. общий угол ошибки ориентации
+        };
+
+        float correction_roll = _esn_roll.update(features_roll);
+        correction_roll = constrain_float(correction_roll, -6.0f, 0.5f);
+        float scale_roll = expf(correction_roll);
+        scale_roll = constrain_float(scale_roll, 0.01f, 1.65f);
+
+        // ─── Вектор из 12 признаков для ESN по ТАНГАЖУ ───
+        float features_pitch[12] = {
+            pitch_error,          // 1. своя ошибка
+            d_pitch_error,        // 2. своя производная
+            pitch_integral,       // 3. свой интеграл
+            pitch_rate,           // 4. своя фактическая скорость
+            target_pitch_rate,    // 5. своя целевая скорость
+            roll_error,           // 6. соседняя ошибка (контекст)
+            roll_rate,            // 7. соседняя скорость (контекст)
+            yaw_rate,             // 8. рыскание (связь осей)
+            airspeed,             // 9. воздушная скорость
+            alt,                  // 10. высота
+            throttle,             // 11. газ
+            thrust_err_angle      // 12. общий угол ошибки ориентации
+        };
+
+        float correction_pitch = _esn_pitch.update(features_pitch);
+        correction_pitch = constrain_float(correction_pitch, -6.0f, 0.5f);
+        float scale_pitch = expf(correction_pitch);
+        scale_pitch = constrain_float(scale_pitch, 0.01f, 1.65f);
+
+        // ─── Применение масштабов ───
+        _esn_pd_scale.x = scale_roll;
+        _esn_pd_scale.y = scale_pitch;
+        _esn_pd_scale.z = 1.0f;      // yaw не трогаем
+
+        _pd_scale = VECTORF_111;
+        set_PD_scale_mult(_esn_pd_scale);
+
+        // ─── Диагностика (~4 Гц) ───
+        static uint16_t esn_log_counter = 0;
+        if (++esn_log_counter >= 100) {
+            esn_log_counter = 0;
+            float eff_roll_P  = get_rate_roll_pid().kP()  * _esn_pd_scale.x;
+            float eff_pitch_P = get_rate_pitch_pid().kP() * _esn_pd_scale.y;
+            hal.console->printf("ESN: roll(sc=%.3f, effP=%.4f) pitch(sc=%.3f, effP=%.4f)\n",
+                                scale_roll, eff_roll_P, scale_pitch, eff_pitch_P);
+        }
+
+        // ─── Обучение каждой сети на своей ошибке скорости ───
+        Vector3f rate_error = _ang_vel_target_rads - gyro;
+
+        static float filtered_abs_roll_err  = 0.0f;
+        static float filtered_abs_pitch_err = 0.0f;
+
+        filtered_abs_roll_err  = 0.92f * filtered_abs_roll_err  + 0.08f * fabsf(rate_error.x);
+        filtered_abs_pitch_err = 0.92f * filtered_abs_pitch_err + 0.08f * fabsf(rate_error.y);
+
+        float target_correction_roll  = -2.0f * filtered_abs_roll_err;
+        float target_correction_pitch = -2.0f * filtered_abs_pitch_err;
+
+        _esn_roll.train(target_correction_roll);
+        _esn_pitch.train(target_correction_pitch);
+    #endif
+    
     // Record error to handle EKF resets
     _attitude_ang_error = attitude_body.inverse() * _attitude_target;
     // finally update the attitude target
@@ -1165,7 +1295,7 @@ void AC_AttitudeControl::scale_I_to_angle_P()
 // perform any required parameter conversions
 void AC_AttitudeControl::convert_parameters()
 {
-    // PARAMETER_CONVERSION - Added: Jan-2026 for ArduPilot-4.7
+    // PARAMETER_CONVERSION - Added: Jan-2026 for 4.7
 
     // return immediately if no conversion is needed
     if (_angle_max_deg.configured()) {
@@ -1548,3 +1678,23 @@ void AC_AttitudeControl::get_rpy_srate(float &roll_srate, float &pitch_srate, fl
     pitch_srate = get_rate_pitch_pid().get_pid_info().slew_rate;
     yaw_srate = get_rate_yaw_pid().get_pid_info().slew_rate;
 }
+
+#if AP_ESNCONTROLLER_ENABLED
+void AC_AttitudeControl::esn_init()
+{
+    // два независимых экземпляра ESN с одинаковыми гиперпараметрами
+    // 12 входов, 70 нейронов (пропорционально росту размерности)
+    _esn_roll.init(12, 70, 0.9f, 0.1f, 0.01f, 1e-6f, 0.99f);
+    _esn_pitch.init(12, 70, 0.9f, 0.1f, 0.01f, 1e-6f, 0.99f);
+
+    _prev_roll_error = 0.0f;
+    _prev_pitch_error = 0.0f;
+
+    _base_kP_roll  = get_rate_roll_pid().kP();
+    _base_kP_pitch = get_rate_pitch_pid().kP();
+    _base_kP_yaw   = get_rate_yaw_pid().kP();
+
+    _esn_pd_scale = Vector3f(1.0f, 1.0f, 1.0f);
+    set_PD_scale_mult(_esn_pd_scale);
+}
+#endif

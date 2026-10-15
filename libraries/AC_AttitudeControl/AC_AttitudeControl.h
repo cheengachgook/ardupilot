@@ -11,6 +11,7 @@
 #include <AC_PID/AC_PID.h>
 #include <AC_PID/AC_P.h>
 #include <AP_BoardConfig/AP_BoardConfig.h>
+#include <AP_ESNController/AP_ESNController_config.h>
 
 #define AC_ATTITUDE_CONTROL_ANGLE_P                     4.5f             // default angle P gain for roll, pitch and yaw
 
@@ -44,6 +45,12 @@
 #define AC_ATTITUDE_CONTROL_THR_MIX_DEFAULT             0.5f  // ratio controlling the max throttle output during competing requests of low throttle from the pilot (or autopilot) and higher throttle for attitude control.  Higher favours Attitude over pilot input
 #define AC_ATTITUDE_CONTROL_THR_G_BOOST_THRESH          1.0f  // default angle-p/pd throttle boost threshold
 
+
+#if AP_ESNCONTROLLER_ENABLED
+    #include <AP_ESNController/ESNController.h>
+#endif
+
+
 class AC_AttitudeControl {
 public:
     AC_AttitudeControl(AP_AHRS_View &ahrs,
@@ -60,7 +67,26 @@ public:
         {
             _singleton = this;
             AP_Param::setup_object_defaults(this, var_info);
+            
+            /*#if AP_ESNCONTROLLER_ENABLED
+                esn_init();   // <-- вставьте вызов сюда
+            #endif*/
         }
+        
+        #if AP_ESNCONTROLLER_ENABLED
+            #include <AP_ESNController/ESNController.h>
+            ESNController _esn_roll;      // <-- было ESNController _esn;
+            ESNController _esn_pitch;     // <-- новый экземпляр
+            float _prev_roll_error;
+            float _prev_pitch_error;
+            float _base_kP_roll;
+            float _base_kP_pitch;
+            float _base_kP_yaw;
+            Vector3f _esn_pd_scale;
+
+            void esn_init();
+            void esn_reset();
+        #endif
 
     static AC_AttitudeControl *get_singleton(void) {
         return _singleton;
@@ -549,7 +575,9 @@ public:
     static constexpr Vector3f VECTORF_111{1.0f,1.0f,1.0f};
 
 protected:
-
+    
+    // масштаб для динамической корректировки P-коэффициентов rate controller (ESN)
+    //Vector3f _esn_pd_scale;
     // Update rate_target_ang_vel using attitude_error_rot_vec_rad
     Vector3f update_ang_vel_target_from_att_error(const Vector3f &attitude_error_rot_vec_rad);
 

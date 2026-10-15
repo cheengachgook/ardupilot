@@ -1,5 +1,6 @@
 #pragma once
 
+#include <AP_ESNController/AP_ESNController_config.h>
 #include <AP_Common/AP_Common.h>
 #include "AP_AutoTune.h"
 #include <AC_PID/AC_PID.h>
@@ -18,8 +19,7 @@ public:
     // Run pure rate control
     float run_rate_control(float desired_rate_degs, float scaler);
 
-    // setup a one loop FF scale multiplier. This replaces any previous scale applied
-    // so should only be used when only one source of scaling is needed
+    // setup a one loop FF scale multiplier
     void set_ff_scale(float _ff_scale) { ff_scale = _ff_scale; }
 
     // Reset I term
@@ -28,9 +28,7 @@ public:
     // Reset controller
     void reset();
 
-    /*
-      reduce the integrator, used when we have a low scale factor in a quadplane hover
-    */
+    // reduce the integrator, used when we have a low scale factor in a quadplane hover
     void decay_I();
 
     void autotune_start(void);
@@ -78,54 +76,53 @@ protected:
 
     float run_rate_control(float desired_rate_degs, float scaler, bool disable_integrator, bool ground_mode);
 
-    // Return true if the airspeed should be considered as under speed
     virtual bool is_underspeed() const = 0;
 
     // Return the airspeed in m/s
     float get_airspeed() const;
 
-    // Return the measured angle in degrees
     virtual float get_measured_angle_deg() const = 0;
-
-    // Return the measured rate in radians per second
     virtual float get_measured_rate_rads() const = 0;
 
-    // Return true if input shaping should be used
     bool should_apply_input_shaping() const;
-
-    // Return true if rate limits should be applied
     virtual bool should_apply_rate_limits() const = 0;
 
-    // Apply positive and negative rate limits to passed in value
     float rate_limit_degs(float rate_degs) const;
-
-    // Return rate target offset in deg per second, this is used in angle control
     virtual float get_rate_target_offset_degs() const { return 0.0; }
-
-    // Return positive rate limit in deg per second, zero if disabled
     virtual float get_positive_rate_limit_degs() const = 0;
-
-    // Return negative rate limit in deg per second, zero if disabled
     virtual float get_negative_rate_limit_degs() const = 0;
 
-    // Reset input shaping to the given values
     void reset_input_shaping_deg(const float angle_deg, const float rate_degs);
 
-    // Set point tracking for input shaping
     float angle_target_deg;
     float rate_target_degs;
     float accel_target_degss;
 
-    // Input shaping accel limit and angle P gain
     AP_Float accel_limit;
     AP_Float angle_p;
 
     const AP_AutoTune::ATType autotune_type;
 
-private:
+#if AP_ESNCONTROLLER_ENABLED
+    // Виртуальный хук ESN. По умолчанию — масштаб 1.0 (без коррекции).
+    // Производные классы (AP_RollController, AP_PitchController)
+    // переопределяют его, каждый со своей независимой ESN.
+    virtual float esn_update(float rate_err, float desired_rate,
+                             float measured_rate, float scaler)
+    {
+        (void)rate_err; (void)desired_rate; (void)measured_rate; (void)scaler;
+        return 1.0f;
+    }
 
+    // Логирование скорректированных коэффициентов ESN
+    // axis: 0 = roll, 1 = pitch
+    void log_esn_data(uint8_t axis, float scale, float base_kP,
+                      float rate_err, float hp_rate_err,
+                      float correction, float osc_freq, bool oscillating);
+#endif
+
+private:
 #if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-    // Ticks tracking to check that the controller is called once per loop and no more
     uint32_t last_run_ticks;
 #endif
 };

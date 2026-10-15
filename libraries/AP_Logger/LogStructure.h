@@ -411,6 +411,20 @@ struct PACKED log_PID {
     uint8_t flags;
 };
 
+struct PACKED log_ESN {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t  axis;
+    uint8_t  flags;
+    float    scale;
+    float    base_kP;
+    float    kP_eff;
+    float    rate_err;
+    float    hp_rate_err;
+    float    correction;
+    float    osc_freq;
+};
+
 struct PACKED log_WheelEncoder {
     LOG_PACKET_HEADER;
     uint64_t time_us;
@@ -1370,7 +1384,7 @@ enum LogMessages : uint8_t {
     LOG_RCOUT3_MSG,
     LOG_IDS_FROM_FENCE,
     LOG_IDS_FROM_HAL,
-
+    LOG_ESN_MSG = 247,
     _LOG_LAST_MSG_
 };
 

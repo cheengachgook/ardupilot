@@ -380,6 +380,14 @@ struct PACKED log_CMDI {
 const struct LogStructure Plane::log_structure[] = {
     LOG_COMMON_STRUCTURES,
 
+    { LOG_ESN_MSG, sizeof(log_ESN),
+      "ESN", "QBBfffffff",
+      "TimeUS,Axis,Flags,Scale,BaseKP,kPeff,RErr,RHP,RCorr,OscHz",
+      "s#--------",
+      "F---------",
+      true,
+    },
+
 // @LoggerMessage: CTUN
 // @Description: Control Tuning information
 // @Field: TimeUS: Time since system startup

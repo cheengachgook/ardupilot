@@ -16,12 +16,16 @@
 //  Modified by Paul Riseborough
 //
 
-
 #include "AP_FW_Controller.h"
 #include <AP_AHRS/AP_AHRS.h>
 #include <AP_Scheduler/AP_Scheduler.h>
 #include <GCS_MAVLink/GCS.h>
 #include <AP_Math/AP_Math.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Airspeed/AP_Airspeed.h>
+#include <AP_Logger/AP_Logger.h>
+
+extern const AP_HAL::HAL& hal;
 
 AP_FW_Controller::AP_FW_Controller(const AP_FixedWing &parms, const AC_PID::Defaults &defaults, AP_AutoTune::ATType _autotune_type)
     : aparm(parms),
@@ -34,95 +38,69 @@ AP_FW_Controller::AP_FW_Controller(const AP_FixedWing &parms, const AC_PID::Defa
 // Return true if input shaping should be used
 bool AP_FW_Controller::should_apply_input_shaping() const
 {
-    // Must be using rate limits
     if (!should_apply_rate_limits()) {
         return false;
     }
-
-    // Accel limit must be set
     if (!is_positive(accel_limit.get())) {
         return false;
     }
-
-    // auto-tune must not be running
     if ((autotune != nullptr) && autotune->running) {
         return false;
     }
-
     return true;
 }
 
 // Run angle controller
 float AP_FW_Controller::run_angle_control(int32_t desired_angle_cd, float scaler, bool disable_integrator, bool ground_mode)
 {
-    // Ensure tau is valid
     if (gains.tau < 0.05f) {
         gains.tau.set(0.05f);
     }
     const float desired_angle_deg = wrap_180(desired_angle_cd * 0.01);
 
     if (!should_apply_input_shaping()) {
-        // Calculate rate directly from angle error with no input shaping
         angle_err_deg = wrap_180(desired_angle_deg - get_measured_angle_deg());
         float desired_rate_degs = angle_err_deg / gains.tau;
 
-        // Reset input shaping set points
         reset_input_shaping_deg(desired_angle_deg, desired_rate_degs);
-
-        // Add coordination offset
         desired_rate_degs += get_rate_target_offset_degs();
 
-        // Apply rate limits if enabled
         if (should_apply_rate_limits()) {
             desired_rate_degs = rate_limit_degs(desired_rate_degs);
         }
 
-        // Run rate controller
         return run_axis_rate_control(desired_rate_degs, scaler, disable_integrator, ground_mode);
     }
 
-    // Apply input shaping to desired angle
     const float dt = AP::scheduler().get_loop_period_s();
-
     const float accel_max = accel_limit.get();
     const float jerk_limit = accel_max / MAX(gains.tau.get(), 0.1);
 
-    // Ensure the shortest path is taken
     const float angle_error = wrap_180(desired_angle_deg - angle_target_deg);
 
-    // Apply input shaping updating the accel target
     shape_pos_vel_accel(
-        angle_error, 0.0, 0.0, // desired pos, vel and accel
-        0.0, rate_target_degs, accel_target_degss, // current shaped target
-        -get_negative_rate_limit_degs(), get_positive_rate_limit_degs(), // velocity limits
-        -accel_max, accel_max, // accel limits
-        jerk_limit, // jerk limit
+        angle_error, 0.0, 0.0,
+        0.0, rate_target_degs, accel_target_degss,
+        -get_negative_rate_limit_degs(), get_positive_rate_limit_degs(),
+        -accel_max, accel_max,
+        jerk_limit,
         dt, true
     );
 
-    // Integrate pos and vel from updated accel target
     angle_target_deg += rate_target_degs * dt + accel_target_degss * 0.5 * sq(dt);
     rate_target_degs += accel_target_degss * dt;
-
-    // Make sure target remains in the range +-180
     angle_target_deg = wrap_180(angle_target_deg);
 
-    // Calculate angle error
     angle_err_deg = wrap_180(angle_target_deg - get_measured_angle_deg());
 
-    // Use 1 / tau if angle gain is not set
     float angle_gain = 1.0 / gains.tau.get();
     if (is_positive(angle_p.get())) {
         angle_gain = angle_p.get();
     }
 
-    // Apply gain using sqrt controller
     float desired_rate_degs = sqrt_controller(angle_err_deg, angle_gain, accel_max * 0.5, dt);
-
-    // Add feed forward rate demand and offset then constrain to rate limit
     desired_rate_degs = rate_limit_degs(desired_rate_degs + rate_target_degs + get_rate_target_offset_degs());
 
-    // Run rate controller
     return run_axis_rate_control(desired_rate_degs, scaler, disable_integrator, ground_mode);
 }
 
@@ -132,7 +110,6 @@ float AP_FW_Controller::run_angle_control(int32_t desired_angle_cd, float scaler
 float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler, bool disable_integrator, bool ground_mode)
 {
 #if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-    // Check that the controller is called once per loop and no more
     const uint32_t ticks = AP::scheduler().ticks32();
     if (last_run_ticks != 0) {
         if (last_run_ticks == ticks) {
@@ -143,10 +120,9 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler, 
         }
     }
     last_run_ticks = ticks;
-#endif // CONFIG_HAL_BOARD == HAL_BOARD_SITL
+#endif
 
     const float dt = AP::scheduler().get_loop_period_s();
-
     const float eas2tas = AP::ahrs().get_EAS2TAS();
     bool limit_I = fabsf(_last_out) >= 45;
     const float rate_rads = get_measured_rate_rads();
@@ -157,21 +133,28 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler, 
         limit_I = true;
     }
 
-    // the PID elements are scaled by sq(scaler). To use an
-    // unmodified AC_PID object we scale the inputs (target and measurement)
-    //
-    // note that we run AC_PID in radians so that the normal scaling
-    // range for IMAX in AC_PID applies (usually an IMAX value less than 1.0)
     rate_pid.update_all(radians(desired_rate_degs) * scaler * scaler, rate_rads * scaler * scaler, dt, limit_I);
 
     if (underspeed) {
-        // when underspeed we lock the integrator
         rate_pid.set_integrator(old_I);
     }
 
-    // FF and DFF should be scaled by scaler/eas2tas, but since we have scaled
-    // the AC_PID target above by scaler*scaler we need to instead
-    // divide by scaler*eas2tas to get the right scaling
+    
+#if AP_ESNCONTROLLER_ENABLED
+    float esn_scale = 1.0f;
+    // Виртуальный вызов: для roll это AP_RollController::esn_update,
+    // для pitch — AP_PitchController::esn_update
+    const float rate_err_degs = desired_rate_degs - degrees(rate_rads);
+    esn_scale = esn_update(rate_err_degs, desired_rate_degs, degrees(rate_rads), scaler);
+
+    static uint16_t esn_dbg_cnt = 0;
+    if (++esn_dbg_cnt >= 50) {
+        esn_dbg_cnt = 0;
+        hal.console->printf("ESN: scale=%.3f rate_err=%.2f desired=%.1f actual=%.1f\n",
+                    esn_scale, rate_err_degs, desired_rate_degs, degrees(rate_rads));
+    }
+#endif
+
     const float ff = degrees(ff_scale * rate_pid.get_ff_component() / (scaler * eas2tas));
     const float dff = degrees(ff_scale * rate_pid.get_dff_component() / (scaler * eas2tas));
     ff_scale = 1.0;
@@ -180,7 +163,6 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler, 
         rate_pid.reset_I();
     }
 
-    // convert AC_PID info object to same scale as old controller
     _pid_info = rate_pid.get_pid_info();
     auto &pinfo = _pid_info;
 
@@ -191,67 +173,57 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler, 
     pinfo.D *= deg_scale;
     pinfo.DFF = dff;
 
-    // fix the logged target and actual values to not have the scalers applied
+#if AP_ESNCONTROLLER_ENABLED
+    pinfo.P *= esn_scale;
+    pinfo.D *= esn_scale;
+#endif
+
     pinfo.target = desired_rate_degs;
     pinfo.actual = degrees(rate_rads);
 
-    // sum components
     float out = pinfo.FF + pinfo.P + pinfo.I + pinfo.D + pinfo.DFF;
     if (ground_mode) {
-        // when on ground suppress D and half P term to prevent oscillations
         out -= pinfo.D + 0.5*pinfo.P;
     }
 
-    // remember the last output to trigger the I limit
     _last_out = out;
 
     if (autotune != nullptr && autotune->running && get_airspeed() > aparm.airspeed_min) {
-        // let autotune have a go at the values
         autotune->update(pinfo, scaler, angle_err_deg);
     }
 
-    // output is scaled to notional centidegrees of deflection
     return constrain_float(out * 100, -4500, 4500);
 }
 
 /*
- Function returns an equivalent control surface deflection in centi-degrees in the range from -4500 to 4500
+ Function returns an equivalent control surface deflection in centi-degrees
 */
 float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler)
 {
-    // Zero angle error in pure rate control
     angle_err_deg = 0.0;
 
     if (!should_apply_input_shaping()) {
-        // Reset input shaping set points
         reset_input_shaping_deg(get_measured_angle_deg(), desired_rate_degs);
-
-        // run rate control with no input shaping
         return run_rate_control(desired_rate_degs, scaler, false, false);
     }
 
-    // Apply input shaping to desired rate
     const float dt = AP::scheduler().get_loop_period_s();
-
-    // Reset the input shaping target angle
     angle_target_deg = get_measured_angle_deg();
 
     const float accel_max = accel_limit.get();
     const float jerk_limit = accel_max / MAX(gains.tau.get(), 0.1);
 
-    // Apply input shaping updating the accel target
     shape_pos_vel_accel(
-        0.0, desired_rate_degs, 0.0, // desired pos, vel and accel
-        0.0, rate_target_degs, accel_target_degss, // current shaped target
-        -get_negative_rate_limit_degs(), get_positive_rate_limit_degs(), // velocity limits
-        -accel_max, accel_max, // accel limits
-        jerk_limit, // jerk limit
+        0.0, desired_rate_degs, 0.0,
+        0.0, rate_target_degs, accel_target_degss,
+        -get_negative_rate_limit_degs(), get_positive_rate_limit_degs(),
+        -accel_max, accel_max,
+        jerk_limit,
         dt, true
     );
 
     rate_target_degs += accel_target_degss * dt;
 
-    // Run rate controller
     return run_rate_control(rate_target_degs, scaler, false, false);
 }
 
@@ -262,19 +234,12 @@ void AP_FW_Controller::reset_I()
     _last_out = 0.0;
 }
 
-/*
-    reduce the integrator, used when we have a low scale factor in a quadplane hover
-*/
 void AP_FW_Controller::decay_I()
 {
-    // this reduces integrator by 95% over 2s
     _pid_info.I *= 0.995f;
     rate_pid.set_integrator(rate_pid.get_i() * 0.995);
 }
 
-/*
-  restore autotune gains
- */
 void AP_FW_Controller::autotune_restore(void)
 {
     if (autotune != nullptr) {
@@ -282,9 +247,6 @@ void AP_FW_Controller::autotune_restore(void)
     }
 }
 
-/*
-  start an autotune
- */
 void AP_FW_Controller::autotune_start(void)
 {
     if (autotune == nullptr) {
@@ -306,7 +268,6 @@ float AP_FW_Controller::get_airspeed() const
 {
     float aspeed;
     if (!AP::ahrs().airspeed_EAS(aspeed)) {
-        // If no airspeed available use average of min and max
         aspeed = 0.5f*(float(aparm.airspeed_min) + float(aparm.airspeed_max));
     }
     return aspeed;
@@ -316,49 +277,34 @@ float AP_FW_Controller::get_airspeed() const
 void AP_FW_Controller::reset()
 {
 #if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-    // Reset tick tracking
     last_run_ticks = 0;
-#endif // CONFIG_HAL_BOARD == HAL_BOARD_SITL
-
-    // Reset PID
+#endif
     rate_pid.reset_I();
     rate_pid.reset_filter();
     _last_out = 0.0;
-
-    // Reset input shaping
     reset_input_shaping_deg(get_measured_angle_deg(), degrees(get_measured_rate_rads()));
 }
 
-// Apply positive and negative rate limits to passed in value
 float AP_FW_Controller::rate_limit_degs(float rate_degs) const
 {
     const float pos_rate_limit = get_positive_rate_limit_degs();
     if (is_positive(pos_rate_limit)) {
         rate_degs = MIN(rate_degs, pos_rate_limit);
     }
-
     const float neg_rate_limit = get_negative_rate_limit_degs();
     if (is_positive(neg_rate_limit)) {
         rate_degs = MAX(rate_degs, -neg_rate_limit);
     }
-
     return rate_degs;
 }
 
-// Reset input shaping applying rate limits
 void AP_FW_Controller::reset_input_shaping_deg(const float angle_deg, const float rate_degs)
 {
-    // No angle limits at the controller level, reset to the passed in angle
     angle_target_deg = angle_deg;
-
-    // Reset to passed in rate and apply rate limits
     rate_target_degs = rate_limit_degs(rate_degs);
-
-    // Reset accel to zero
     accel_target_degss = 0.0;
 }
 
-// Get input shaping angle, rate and accel for logging
 void AP_FW_Controller::get_input_shaping(float &angle_deg, float &rate_degs, float &accel_degss) const
 {
     angle_deg = angle_target_deg;
@@ -366,21 +312,61 @@ void AP_FW_Controller::get_input_shaping(float &angle_deg, float &rate_degs, flo
     accel_degss = accel_target_degss;
 }
 
-// Reset the attitude target to such that a change in attitude due to an ahrs change is smooth
 void AP_FW_Controller::ahrs_reset()
 {
-    // Update the target angle such that the angle error remains the same before and after the change in measured angle from the ahrs
     angle_target_deg = wrap_180(get_measured_angle_deg() + angle_err_deg);
 }
 
-// Get angle P gain
 float AP_FW_Controller::get_angle_p() const
 {
     if (should_apply_input_shaping() && is_positive(angle_p.get())) {
-        // Angle gain is in use and configured
         return angle_p.get();
     }
-
-    // angle gain = 1 / tau
     return 1.0 / gains.tau.get();
 }
+
+#if AP_ESNCONTROLLER_ENABLED
+void AP_FW_Controller::log_esn_data(uint8_t axis, float scale, float base_kP,
+                                    float rate_err, float hp_rate_err,
+                                    float correction, float osc_freq, bool oscillating)
+{
+#if HAL_LOGGING_ENABLED
+    // Ограничиваем частоту логирования до 25 Гц на каждую ось,
+    // чтобы не забивать лог
+    static uint32_t last_log_ms[2] = {0, 0};
+    if (axis > 1) {
+        return;
+    }
+
+    const uint32_t now_ms = AP_HAL::millis();
+    if (now_ms - last_log_ms[axis] < 40) {   // 40 мс = 25 Гц
+        return;
+    }
+    last_log_ms[axis] = now_ms;
+
+    // Логируем всегда, когда логирование активно.
+    // Ограничение по частоте уже сделано выше (25 Гц).
+    if (!AP::logger().logging_started()) {
+        return;
+    }
+    
+    const uint8_t flags = (oscillating ? 0x01 : 0x00);
+    const float kP_eff = base_kP * scale;
+
+    const struct log_ESN pkt {
+        LOG_PACKET_HEADER_INIT(LOG_ESN_MSG),
+        time_us     : AP_HAL::micros64(),
+        axis        : axis,
+        flags       : flags,
+        scale       : scale,
+        base_kP     : base_kP,
+        kP_eff      : kP_eff,
+        rate_err    : rate_err,
+        hp_rate_err : hp_rate_err,
+        correction  : correction,
+        osc_freq    : osc_freq
+    };
+    AP::logger().WriteBlock(&pkt, sizeof(pkt));
+#endif
+}
+#endif
