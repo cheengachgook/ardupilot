@@ -25,19 +25,66 @@ static float rand_gaussian() {
     return sqrtf(-2.0f * logf(u1 + 1e-12f)) * cosf(2.0f * M_PI * u2);
 }
 
+// ---------------------------------------------------------------------------
+// Освобождение памяти. delete[] на nullptr безопасен — можно вызывать
+// многократно, в том числе из деструктора после init().
+// ---------------------------------------------------------------------------
+void ESNController::free_buffers() {
+    delete[] W_in;           W_in = nullptr;
+    delete[] W_res;          W_res = nullptr;
+    delete[] W_out;          W_out = nullptr;
+    delete[] state;          state = nullptr;
+    delete[] extended_state; extended_state = nullptr;
+    delete[] P;              P = nullptr;
+    delete[] input_mean;     input_mean = nullptr;
+    delete[] input_std;      input_std = nullptr;
+
+    delete[] _u_norm;            _u_norm = nullptr;
+    delete[] _reservoir_scratch; _reservoir_scratch = nullptr;
+    delete[] _noisy_state;       _noisy_state = nullptr;
+    delete[] _P_s;               _P_s = nullptr;
+    delete[] _g;                 _g = nullptr;
+    delete[] _sP;                _sP = nullptr;
+    delete[] _new_P;             _new_P = nullptr;
+    delete[] _eig_vec;           _eig_vec = nullptr;
+    delete[] _eig_new_vec;       _eig_new_vec = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Единственное место, где выделяется вся память.
+// Вызывается только из init().
+// ---------------------------------------------------------------------------
+void ESNController::alloc_buffers() {
+    const uint16_t ext_size = n_reservoir + n_inputs;
+
+    W_in  = new float[n_reservoir * n_inputs];
+    W_res = new float[n_reservoir * n_reservoir];
+    W_out = new float[ext_size];
+
+    state          = new float[n_reservoir];
+    extended_state = new float[ext_size];
+    P              = new float[ext_size * ext_size];
+    input_mean     = new float[n_inputs];
+    input_std      = new float[n_inputs];
+
+    // Предварительно выделенные рабочие буферы
+    _u_norm            = new float[n_inputs];
+    _reservoir_scratch = new float[n_reservoir];
+    _noisy_state       = new float[ext_size];
+    _P_s               = new float[ext_size];
+    _g                 = new float[ext_size];
+    _sP                = new float[ext_size];
+    _new_P             = new float[ext_size * ext_size];
+    _eig_vec           = new float[n_reservoir];
+    _eig_new_vec       = new float[n_reservoir];
+}
+
 void ESNController::init(uint8_t _n_inputs, uint8_t _n_reservoir,
                          float _sr, float _lr, float _noise,
                          float _reg, float _lam)
 {
-    // Освобождаем память, если уже инициализировано
-    if (W_in) delete[] W_in;
-    if (W_res) delete[] W_res;
-    if (W_out) delete[] W_out;
-    if (state) delete[] state;
-    if (extended_state) delete[] extended_state;
-    if (P) delete[] P;
-    if (input_mean) delete[] input_mean;
-    if (input_std) delete[] input_std;
+    // Освобождаем всё, что было выделено ранее (если init вызывается повторно)
+    free_buffers();
 
     // Читаем из AP_Param, если значение задано; иначе используем переданное
     n_inputs = _n_inputs;
@@ -48,17 +95,7 @@ void ESNController::init(uint8_t _n_inputs, uint8_t _n_reservoir,
     regularization  = (cfg_regularization.get() > 0.0f) ? cfg_regularization.get()  : _reg;
     lambda          = (cfg_lambda.get() > 0.0f)         ? cfg_lambda.get()          : _lam;
 
-    W_in = new float[n_reservoir * n_inputs];
-    W_res = new float[n_reservoir * n_reservoir];
-    W_out = new float[n_reservoir + n_inputs];
-
-    state = new float[n_reservoir];
-    extended_state = new float[n_reservoir + n_inputs];
-
-    P = new float[(n_reservoir + n_inputs) * (n_reservoir + n_inputs)];
-
-    input_mean = new float[n_inputs];
-    input_std = new float[n_inputs];
+    alloc_buffers();
 
     srand(time(nullptr));
     init_weights();
@@ -75,14 +112,7 @@ void ESNController::init(uint8_t _n_inputs, uint8_t _n_reservoir,
 }
 
 ESNController::~ESNController() {
-    delete[] W_in;
-    delete[] W_res;
-    delete[] W_out;
-    delete[] state;
-    delete[] extended_state;
-    delete[] P;
-    delete[] input_mean;
-    delete[] input_std;
+    free_buffers();
 }
 
 // ---------------------------------------------------------------------------
@@ -106,21 +136,24 @@ void ESNController::init_weights() {
     }
 
     // Масштабирование до заданного спектрального радиуса (power method)
-    float* vec = new float[n_reservoir];
-    for (uint8_t i = 0; i < n_reservoir; i++) vec[i] = rand_gaussian();
+    // Используем предаллоцированные _eig_vec / _eig_new_vec — без new/delete в цикле.
+    for (uint8_t i = 0; i < n_reservoir; i++) {
+        _eig_vec[i] = rand_gaussian();
+    }
     float prev_norm = 0;
     float max_eig = 1.0f;
     for (int iter = 0; iter < 50; iter++) {
-        float* new_vec = new float[n_reservoir];
         for (uint8_t i = 0; i < n_reservoir; i++) {
             float sum = 0;
             for (uint8_t j = 0; j < n_reservoir; j++) {
-                sum += W_res[i * n_reservoir + j] * vec[j];
+                sum += W_res[i * n_reservoir + j] * _eig_vec[j];
             }
-            new_vec[i] = sum;
+            _eig_new_vec[i] = sum;
         }
         float norm = 0;
-        for (uint8_t i = 0; i < n_reservoir; i++) norm += new_vec[i] * new_vec[i];
+        for (uint8_t i = 0; i < n_reservoir; i++) {
+            norm += _eig_new_vec[i] * _eig_new_vec[i];
+        }
         norm = sqrtf(norm);
         if (iter > 10 && prev_norm > 0) {
             max_eig = norm / prev_norm;
@@ -128,10 +161,10 @@ void ESNController::init_weights() {
             if (max_eig > 1e-4) break;
         }
         prev_norm = norm;
-        for (uint8_t i = 0; i < n_reservoir; i++) vec[i] = new_vec[i];
-        delete[] new_vec;
+        for (uint8_t i = 0; i < n_reservoir; i++) {
+            _eig_vec[i] = _eig_new_vec[i];
+        }
     }
-    delete[] vec;
 
     if (max_eig < 1e-6) max_eig = 1.0f;
     float scale = spectral_radius / max_eig;
@@ -164,33 +197,28 @@ void ESNController::normalize(const float* u, float* u_norm) {
 
 // ---------------------------------------------------------------------------
 // Обновление состояния резервуара (leaky integrator + tanh)
+// Рекуррентная часть считается от СТАРОГО state в scratch-буфер,
+// затем к ней добавляется входная часть и state обновляется на месте.
 // ---------------------------------------------------------------------------
 void ESNController::compute_new_state(const float* u_norm) {
-    float* input_part = new float[n_reservoir];
-    for (uint8_t i = 0; i < n_reservoir; i++) {
-        float sum = 0;
-        for (uint8_t j = 0; j < n_inputs; j++) {
-            sum += W_in[i * n_inputs + j] * u_norm[j];
-        }
-        input_part[i] = sum;
-    }
-
-    float* reservoir_part = new float[n_reservoir];
+    // W_res · state (старое состояние)
     for (uint8_t i = 0; i < n_reservoir; i++) {
         float sum = 0;
         for (uint8_t j = 0; j < n_reservoir; j++) {
             sum += W_res[i * n_reservoir + j] * state[j];
         }
-        reservoir_part[i] = sum;
+        _reservoir_scratch[i] = sum;
     }
 
+    // W_in · u + предыдущий результат → tanh → leaky update
     for (uint8_t i = 0; i < n_reservoir; i++) {
-        float activation = tanhf(input_part[i] + reservoir_part[i]);
+        float sum = _reservoir_scratch[i];
+        for (uint8_t j = 0; j < n_inputs; j++) {
+            sum += W_in[i * n_inputs + j] * u_norm[j];
+        }
+        float activation = tanhf(sum);
         state[i] = (1 - leak_rate) * state[i] + leak_rate * activation;
     }
-
-    delete[] input_part;
-    delete[] reservoir_part;
 }
 
 // ---------------------------------------------------------------------------
@@ -217,14 +245,9 @@ float ESNController::predict() const {
 // Основной метод обновления: нормализация, новое состояние, предсказание
 // ---------------------------------------------------------------------------
 float ESNController::update(const float* u) {
-    float* u_norm = new float[n_inputs];
-    normalize(u, u_norm);
-
-    compute_new_state(u_norm);
-    form_extended_state(u_norm);
-
-    delete[] u_norm;
-
+    normalize(u, _u_norm);
+    compute_new_state(_u_norm);
+    form_extended_state(_u_norm);
     return predict();
 }
 
@@ -233,92 +256,81 @@ float ESNController::update(const float* u) {
 // ---------------------------------------------------------------------------
 void ESNController::train(float target) {
     const uint16_t ext_size = n_reservoir + n_inputs;
-
+    const float inv_lambda = 1.0f / lambda;
     // Добавление шума
-    float* noisy_state = new float[ext_size];
     for (uint16_t i = 0; i < ext_size; i++) {
-        noisy_state[i] = extended_state[i] + rand_gaussian() * noise_level;
+        _noisy_state[i] = extended_state[i] + rand_gaussian() * noise_level;
     }
 
     const float prediction = predict();
     const float error = target - prediction;
 
     // P · s
-    float* P_s = new float[ext_size];
     for (uint16_t i = 0; i < ext_size; i++) {
         float sum = 0;
         const float* P_row = &P[i * ext_size];
         for (uint16_t j = 0; j < ext_size; j++) {
-            sum += P_row[j] * noisy_state[j];
+            sum += P_row[j] * _noisy_state[j];
         }
-        P_s[i] = sum;
+        _P_s[i] = sum;
     }
 
     // Знаменатель: λ + s^T · P · s + reg
     float denom = lambda + regularization;
     for (uint16_t i = 0; i < ext_size; i++) {
-        denom += noisy_state[i] * P_s[i];
+        denom += _noisy_state[i] * _P_s[i];
     }
     if (fabsf(denom) < 1e-12f) denom = 1e-12f;
 
     // Вектор усиления
-    float* g = new float[ext_size];
     for (uint16_t i = 0; i < ext_size; i++) {
-        g[i] = P_s[i] / denom;
+        _g[i] = _P_s[i] / denom;
     }
 
     // Обновление W_out
     for (uint16_t i = 0; i < ext_size; i++) {
-        W_out[i] += error * g[i];
+        W_out[i] += error * _g[i];
     }
 
     // s^T · P — один раз, обход по строкам
-    float* sP = new float[ext_size];
     for (uint16_t j = 0; j < ext_size; j++) {
-        sP[j] = 0.0f;
+        _sP[j] = 0.0f;
     }
     for (uint16_t k = 0; k < ext_size; k++) {
-        const float sk = noisy_state[k];
+        const float sk = _noisy_state[k];
         const float* P_row = &P[k * ext_size];
         for (uint16_t j = 0; j < ext_size; j++) {
-            sP[j] += sk * P_row[j];
+            _sP[j] += sk * P_row[j];
         }
     }
 
-    // Обновление P = (P - g · sP) / λ
-    float* new_P = new float[ext_size * ext_size];
+    // new_P = (P - g · sP) / λ
     for (uint16_t i = 0; i < ext_size; i++) {
-        const float gi = g[i];
+        const float gi = _g[i];
         const float* P_row = &P[i * ext_size];
-        float* newP_row = &new_P[i * ext_size];
+        float* newP_row = &_new_P[i * ext_size];
         for (uint16_t j = 0; j < ext_size; j++) {
-            newP_row[j] = (P_row[j] - gi * sP[j]) / lambda;
+            newP_row[j] = (P_row[j] - gi * _sP[j]) * inv_lambda;
         }
     }
 
     // Симметризация P
     for (uint16_t i = 0; i < ext_size; i++) {
         for (uint16_t j = i + 1; j < ext_size; j++) {
-            float avg = (new_P[i * ext_size + j] + new_P[j * ext_size + i]) * 0.5f;
-            new_P[i * ext_size + j] = avg;
-            new_P[j * ext_size + i] = avg;
+            float avg = (_new_P[i * ext_size + j] + _new_P[j * ext_size + i]) * 0.5f;
+            _new_P[i * ext_size + j] = avg;
+            _new_P[j * ext_size + i] = avg;
         }
     }
     for (uint16_t i = 0; i < ext_size; i++) {
-        new_P[i * ext_size + i] += regularization;
+        _new_P[i * ext_size + i] += regularization;
     }
 
-    memcpy(P, new_P, ext_size * ext_size * sizeof(float));
-
-    delete[] noisy_state;
-    delete[] P_s;
-    delete[] g;
-    delete[] sP;
-    delete[] new_P;
+    memcpy(P, _new_P, ext_size * ext_size * sizeof(float));
 }
 
 // ---------------------------------------------------------------------------
-// Сброс состояния сети и RLS, нормализация сбрасывается в начальное
+// Сброс состояния сети и RLS
 // ---------------------------------------------------------------------------
 void ESNController::reset() {
     memset(state, 0, n_reservoir * sizeof(float));
@@ -353,4 +365,3 @@ bool ESNController::reload_params()
 
     return need_full_reinit;
 }
-

@@ -27,8 +27,11 @@ const AP_Param::GroupInfo AP_PitchController::var_info[] = {
     AP_GROUPINFO("_ANGLE_P",        13, AP_PitchController, angle_p, 0.0),
 
 #if AP_ESNCONTROLLER_ENABLED
-    AP_SUBGROUPINFO(_esn, "_ESN_", 14, AP_PitchController, ESNController),
-    AP_GROUPINFO("_ESN_RESET",  15, AP_PitchController, _esn_reset_param, 0),
+    // Сеть для P: префикс _ESN_
+    AP_SUBGROUPINFO(_esn_P, "_ESN_", 14, AP_PitchController, ESNController),
+    AP_GROUPINFO("_ESN_RESET", 15, AP_PitchController, _esn_reset_param, 0),
+    // Сеть для D: префикс _ESND_
+    AP_SUBGROUPINFO(_esn_D, "_ESND_", 16, AP_PitchController, ESNController),
 #endif
 
     AP_GROUPEND
@@ -57,37 +60,54 @@ AP_PitchController::AP_PitchController(const AP_FixedWing &parms)
 float AP_PitchController::esn_update(float rate_err, float desired_rate,
                                      float measured_rate, float scaler)
 {
-    // 1. Триггер сброса (с обнулением состояния)
+    // ─── 1. Триггер сброса ───
     if (_esn_reset_param.get() != 0) {
         _esn_reset_param.set(0);
         _esn_initialized = false;
         _prev_eff_err = 0.0f;
-        _filtered_indicator = 0.0f;
+        _filtered_indicator_P = 0.0f;
+        _filtered_indicator_D = 0.0f;
+        _filtered_indicator_gyro = 0.0f;
         _lp_rate_err = 0.0f;
-        _prev_hp = 0.0f;
-        _sign_changes = 0;
+        _lp_gyro_fast = 0.0f;
+        _lp_gyro_slow = 0.0f;
+        _prev_hp_rate = 0.0f;
+        _prev_hp_gyro = 0.0f;
         _prev_sign = 0;
+        _sign_changes = 0;
         _last_check_ms = 0;
         _osc_freq = 0.0f;
+         _esn_train_divider = 0;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "ESN Pitch: reset requested");
     }
 
-    // 2. Ленивая инициализация
+    // ─── 2. Ленивая инициализация ───
     if (!_esn_initialized) {
-        _esn.init(12, 70);
+        _esn_P.init(12, 70);
+        _esn_D.init(12, 70);
         _base_kP = rate_pid.kP();
         _base_kD = rate_pid.kD();
-        _esn_scale = 1.0f;
+        _esn_scale_P = 1.0f;
+        _esn_scale_D = 1.0f;
         _esn_initialized = true;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                      "ESN Pitch: init done, base_kP=%.4f",
-                      (double)_base_kP);
+                      "ESN Pitch: init done, base_kP=%.4f base_kD=%.5f",
+                      (double)_base_kP, (double)_base_kD);
     }
 
     const float dt = AP::scheduler().get_loop_period_s();
+    const bool do_train = (++_esn_train_divider >= _ESN_TRAIN_DIVIDER);
+    if (do_train) {
+        _esn_train_divider = 0;
+    }
 
-    // 3. Признаки для сети
+    // ─── 3. Общие признаки ───
+    // Гироскоп переводим в °/с — единый формат со всем остальным кодом
     const Vector3f gyro = AP::ahrs().get_gyro();
+    const float gyro_x_deg = degrees(gyro.x);
+    const float gyro_y_deg = degrees(gyro.y);
+    const float gyro_z_deg = degrees(gyro.z);
+    const float gyro_axis_deg = gyro_y_deg;   // активная ось для pitch
 
     float airspeed = 0.0f;
     const AP_Airspeed &aspeed = AP::airspeed();
@@ -103,34 +123,37 @@ float AP_PitchController::esn_update(float rate_err, float desired_rate,
     const float rate_err_deriv = (rate_err - _prev_rate_err) / dt;
     _prev_rate_err = rate_err;
 
+    // ─── 4. Feature-вектор (всё в °/с) ───
     float features[12] = {
         rate_err, rate_err_deriv, desired_rate, measured_rate,
-        gyro.x, gyro.y, gyro.z,
+        gyro_x_deg, gyro_y_deg, gyro_z_deg,
         airspeed, alt, scaler,
-        _esn_scale, _base_kP
+        _esn_scale_P, _base_kP
     };
 
-    // 4. Прямой проход
-    float correction = _esn.update(features);
-    correction = constrain_float(correction, -4.0f, 0.5f);
+    // ══════════════════════════════════════════════════════════════════
+    // ЧАСТЬ 1. СЕТЬ ДЛЯ P
+    // ══════════════════════════════════════════════════════════════════
 
-    float new_scale = expf(correction);
-    new_scale = constrain_float(new_scale, 0.1f, 1.5f);
+    float correction_P = _esn_P.update(features);
+    correction_P = constrain_float(correction_P, -3.0f, 0.3f);
+    float new_scale_P = expf(correction_P);
+    new_scale_P = constrain_float(new_scale_P, 0.15f, 1.5f);
 
-    // 5. HP-фильтр для выделения колебаний
-    const float lpf_alpha = 0.98f;
-    _lp_rate_err = lpf_alpha * _lp_rate_err + (1.0f - lpf_alpha) * rate_err;
+    // ─── HP-фильтр rate_err (детектор ошибки) ───
+    const float lpf_alpha_slow = 0.99f;
+    _lp_rate_err = lpf_alpha_slow * _lp_rate_err + (1.0f - lpf_alpha_slow) * rate_err;
     const float hp_rate_err = rate_err - _lp_rate_err;
 
-    const float hp_deriv = constrain_float((hp_rate_err - _prev_hp) / dt, -10.0f, 10.0f);
-    _prev_hp = hp_rate_err;
+    const float hp_deriv = constrain_float((hp_rate_err - _prev_hp_rate) / dt, -10.0f, 10.0f);
+    _prev_hp_rate = hp_rate_err;
 
-    const float indicator = fabsf(hp_rate_err) + 0.2f * fabsf(hp_deriv);
-    _filtered_indicator = 0.92f * _filtered_indicator + 0.08f * indicator;
+    const float indicator_P = fabsf(hp_rate_err) + 0.2f * fabsf(hp_deriv);
+    _filtered_indicator_P = 0.92f * _filtered_indicator_P + 0.08f * indicator_P;
 
-    // 6. Детектор смены знака (реальная раскачка)
+    // ─── Детектор знакопеременности rate_err ───
     const int8_t curr_sign = (hp_rate_err >= 0.0f) ? 1 : -1;
-    if (curr_sign != _prev_sign && fabsf(hp_rate_err) > 1.0f) {
+    if (curr_sign != _prev_sign && fabsf(hp_rate_err) > 0.3f) {
         _sign_changes++;
     }
     _prev_sign = curr_sign;
@@ -142,29 +165,124 @@ float AP_PitchController::esn_update(float rate_err, float desired_rate,
         _last_check_ms = now_ms;
     }
 
-    const bool oscillating = (_osc_freq > 2.0f);
+    // ─── Детектор раскачки по гироскопу (ось Y, °/с) ───
+    const float lpf_alpha_gyro = 0.98f;
+    _lp_gyro_slow = lpf_alpha_gyro * _lp_gyro_slow + (1.0f - lpf_alpha_gyro) * gyro_axis_deg;
+    const float hp_gyro_slow = gyro_axis_deg - _lp_gyro_slow;
 
-    // 7. Обучение только при реальной раскачке
-    if (oscillating && _filtered_indicator > 5.0f) {
-        float target_correction = -0.3f * _filtered_indicator;
-        target_correction = constrain_float(target_correction, -2.0f, 0.3f);
-        _esn.train(target_correction);
-    } else {
-        _esn.train(0.0f);
+    // Производная теперь в °/с² — constrain ±500 разумен
+    const float gyro_deriv = constrain_float((hp_gyro_slow - _prev_hp_gyro) / dt, -500.0f, 500.0f);
+    _prev_hp_gyro = hp_gyro_slow;
+
+    const float indicator_gyro = fabsf(hp_gyro_slow) + 0.2f * fabsf(gyro_deriv);
+    _filtered_indicator_gyro = 0.92f * _filtered_indicator_gyro + 0.08f * indicator_gyro;
+
+    // ─── Обучение P-сети ───
+    const bool is_maneuver_P = fabsf(desired_rate) > 20.0f;   // °/с
+
+    const bool oscillating_P = ((_filtered_indicator_P > 3.0f) ||
+                                (_filtered_indicator_gyro > 5.0f)) &&
+                               !is_maneuver_P;
+
+    if (do_train) {
+        if (oscillating_P) {
+            const float best_ind = MAX(_filtered_indicator_P, _filtered_indicator_gyro);
+            float target_P = -0.3f * best_ind;
+            target_P = constrain_float(target_P, -2.0f, 0.3f);
+            _esn_P.train(target_P);
+        } else {
+            _esn_P.train(0.0f);
+        }
     }
 
+    // ─── Rate-limiter для scale_P ───
+    const float max_delta_P = 0.03f;
+    new_scale_P = constrain_float(new_scale_P,
+                                  _esn_scale_P - max_delta_P,
+                                  _esn_scale_P + max_delta_P);
+
+    // ══════════════════════════════════════════════════════════════════
+    // ЧАСТЬ 2. СЕТЬ ДЛЯ D — двунаправленная адаптация
+    // ══════════════════════════════════════════════════════════════════
+
+    float correction_D = _esn_D.update(features);
+    correction_D = constrain_float(correction_D, -3.0f, 0.8f);
+    float new_scale_D = expf(correction_D);
+    new_scale_D = constrain_float(new_scale_D, 0.15f, 4.0f);
+
+    // ─── HF-шум гироскопа (°/с) ───
+    const float lpf_alpha_fast = 0.95f;
+    _lp_gyro_fast = lpf_alpha_fast * _lp_gyro_fast + (1.0f - lpf_alpha_fast) * gyro_axis_deg;
+    const float hp_gyro_fast = gyro_axis_deg - _lp_gyro_fast;
+
+    const float hf_energy = hp_gyro_fast * hp_gyro_fast;   // (°/с)²
+    _filtered_indicator_D = 0.92f * _filtered_indicator_D + 0.08f * hf_energy;
+
+    // ─── Три режима D-адаптации ───
+    const bool is_maneuver_D = fabsf(desired_rate) > 30.0f;   // °/с
+
+    const bool need_less_damping = (_filtered_indicator_D > 0.5f);          // (°/с)²
+    const bool need_more_damping = (_filtered_indicator_D < 0.05f) &&       // (°/с)²
+                                   (_filtered_indicator_gyro > 1.5f) &&     // °/с
+                                   !is_maneuver_D;
+
+    if (do_train) {
+        float target_D = 0.0f;
+        if (need_less_damping) {
+            target_D = -0.3f * _filtered_indicator_D;
+        } else if (need_more_damping) {
+            target_D = +0.10f * _filtered_indicator_gyro;
+        }
+        target_D = constrain_float(target_D, -1.0f, 0.8f);
+        _esn_D.train(target_D);
+    }
+
+    // ─── Rate-limiter для scale_D ───
+    const float max_delta_D = 0.02f;
+    new_scale_D = constrain_float(new_scale_D,
+                                  _esn_scale_D - max_delta_D,
+                                  _esn_scale_D + max_delta_D);
+
+    // ══════════════════════════════════════════════════════════════════
+    // ЧАСТЬ 3. ПРИМЕНЕНИЕ КОЭФФИЦИЕНТОВ
+    // ══════════════════════════════════════════════════════════════════
+
+    const float new_kP = _base_kP * new_scale_P;
+    const float new_kD = _base_kD * new_scale_D;
+
+    rate_pid.kP().set(new_kP);
+    rate_pid.kD().set(new_kD);
+
+    // Отладочный вывод раз в секунду
+    static uint32_t last_dbg_ms = 0;
+    if (AP_HAL::millis() - last_dbg_ms >= 1000) {
+        last_dbg_ms = AP_HAL::millis();
+        hal.console->printf("ESN Pitch: ind_P=%.2f ind_gyro=%.2f ind_D=%.3f scale_P=%.3f scale_D=%.3f kP=%.4f kD=%.5f\n",
+                            (double)_filtered_indicator_P,
+                            (double)_filtered_indicator_gyro,
+                            (double)_filtered_indicator_D,
+                            (double)new_scale_P,
+                            (double)new_scale_D,
+                            (double)rate_pid.kP(),
+                            (double)rate_pid.kD());
+
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                      "ESN Pitch: kP=%.4f kD=%.5f scale_P=%.3f scale_D=%.3f",
+                      (double)rate_pid.kP(),
+                      (double)rate_pid.kD(),
+                      (double)new_scale_P,
+                      (double)new_scale_D);
+    }
+
+    _esn_scale_P = new_scale_P;
+    _esn_scale_D = new_scale_D;
+
     log_esn_data(
-        1,                  // axis: roll
-        new_scale,          // текущий масштаб
-        _base_kP,           // базовый kP
-        rate_err,           // ошибка скорости
-        hp_rate_err,        // HP-компонента
-        correction,         // выход сети
-        _osc_freq,          // частота колебаний
-        oscillating         // признак раскачки
+        1, new_scale_P, new_scale_D, _base_kP, _base_kD,
+        rate_err, hp_rate_err, hp_gyro_fast, correction_P, _osc_freq, oscillating_P
     );
 
-    return new_scale;
+    return 1.0f;
 }
 #endif
 

@@ -31,7 +31,16 @@ public:
         extended_state(nullptr),
         P(nullptr),
         input_mean(nullptr),
-        input_std(nullptr)
+        input_std(nullptr),
+        _u_norm(nullptr),
+        _reservoir_scratch(nullptr),
+        _noisy_state(nullptr),
+        _P_s(nullptr),
+        _g(nullptr),
+        _sP(nullptr),
+        _new_P(nullptr),
+        _eig_vec(nullptr),
+        _eig_new_vec(nullptr)
     {
         AP_Param::setup_object_defaults(this, var_info);
     }
@@ -76,7 +85,7 @@ private:
     AP_Float  cfg_regularization;
     AP_Float  cfg_lambda;
 
-    // Внутреннее состояние (без изменений)
+    // ─── Постоянные массивы сети ───
     float* W_in;
     float* W_res;
     float* W_out;
@@ -86,10 +95,27 @@ private:
     float* input_mean;
     float* input_std;
 
+    // ─── Предварительно выделенные рабочие буферы ───
+    // Все аллокации выполняются один раз в init(); в hot path (update/train)
+    // динамической памяти не запрашивается.
+    float* _u_norm;             // размер n_inputs
+    float* _reservoir_scratch;  // размер n_reservoir — рекуррентная часть W_res·state
+    float* _noisy_state;        // размер n_reservoir + n_inputs
+    float* _P_s;                // размер n_reservoir + n_inputs — P · s
+    float* _g;                  // размер n_reservoir + n_inputs — вектор усиления
+    float* _sP;                 // размер n_reservoir + n_inputs — s^T · P
+    float* _new_P;              // размер (n_reservoir + n_inputs)^2 — новая матрица P
+    float* _eig_vec;            // размер n_reservoir — для power method в init_weights
+    float* _eig_new_vec;        // размер n_reservoir — для power method в init_weights
+
     void init_weights();
     void init_rls();
     void normalize(const float* u, float* u_norm);
     void compute_new_state(const float* u_norm);
     void form_extended_state(const float* u_norm);
     float predict() const;
+
+    // ─── Управление памятью ───
+    void free_buffers();
+    void alloc_buffers();
 };

@@ -381,10 +381,10 @@ const struct LogStructure Plane::log_structure[] = {
     LOG_COMMON_STRUCTURES,
 
     { LOG_ESN_MSG, sizeof(log_ESN),
-      "ESN", "QBBfffffff",
-      "TimeUS,Axis,Flags,Scale,BaseKP,kPeff,RErr,RHP,RCorr,OscHz",
-      "s#--------",
-      "F---------",
+      "ESN", "QBBfffffffffff",
+      "TimeUS,Ax,Fl,ScP,ScD,bKP,bKD,kPe,kDe,RErr,HP,HGy,RCor,OHz",
+      "s#--kk-------z",
+      "F-------------",
       true,
     },
 

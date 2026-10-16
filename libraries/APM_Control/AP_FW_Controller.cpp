@@ -141,17 +141,16 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler, 
 
     
 #if AP_ESNCONTROLLER_ENABLED
-    float esn_scale = 1.0f;
-    // Виртуальный вызов: для roll это AP_RollController::esn_update,
-    // для pitch — AP_PitchController::esn_update
     const float rate_err_degs = desired_rate_degs - degrees(rate_rads);
-    esn_scale = esn_update(rate_err_degs, desired_rate_degs, degrees(rate_rads), scaler);
+    // esn_update сам применяет коэффициенты через kP().set() / kD().set()
+    esn_update(rate_err_degs, desired_rate_degs, degrees(rate_rads), scaler);
 
+    // Отладочный вывод
     static uint16_t esn_dbg_cnt = 0;
     if (++esn_dbg_cnt >= 50) {
         esn_dbg_cnt = 0;
-        hal.console->printf("ESN: scale=%.3f rate_err=%.2f desired=%.1f actual=%.1f\n",
-                    esn_scale, rate_err_degs, desired_rate_degs, degrees(rate_rads));
+        hal.console->printf("ESN: rate_err=%.2f desired=%.1f actual=%.1f\n",
+                            rate_err_degs, desired_rate_degs, degrees(rate_rads));
     }
 #endif
 
@@ -172,11 +171,6 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler, 
     pinfo.I *= deg_scale;
     pinfo.D *= deg_scale;
     pinfo.DFF = dff;
-
-#if AP_ESNCONTROLLER_ENABLED
-    pinfo.P *= esn_scale;
-    pinfo.D *= esn_scale;
-#endif
 
     pinfo.target = desired_rate_degs;
     pinfo.actual = degrees(rate_rads);
@@ -326,47 +320,44 @@ float AP_FW_Controller::get_angle_p() const
 }
 
 #if AP_ESNCONTROLLER_ENABLED
-void AP_FW_Controller::log_esn_data(uint8_t axis, float scale, float base_kP,
-                                    float rate_err, float hp_rate_err,
-                                    float correction, float osc_freq, bool oscillating)
+void AP_FW_Controller::log_esn_data(uint8_t axis,
+                                    float scale_P, float scale_D,
+                                    float base_kP, float base_kD,
+                                    float rate_err, float hp_rate_err, float hp_gyro,
+                                    float correction_P, float osc_freq, bool oscillating_P)
 {
-#if HAL_LOGGING_ENABLED
-    // Ограничиваем частоту логирования до 25 Гц на каждую ось,
-    // чтобы не забивать лог
-    static uint32_t last_log_ms[2] = {0, 0};
-    if (axis > 1) {
-        return;
-    }
+    #if HAL_LOGGING_ENABLED
+        static uint32_t last_log_ms[2] = {0, 0};
+        if (axis > 1) return;
 
-    const uint32_t now_ms = AP_HAL::millis();
-    if (now_ms - last_log_ms[axis] < 40) {   // 40 мс = 25 Гц
-        return;
-    }
-    last_log_ms[axis] = now_ms;
+        const uint32_t now_ms = AP_HAL::millis();
+        if (now_ms - last_log_ms[axis] < 40) return;   // 25 Гц
+        last_log_ms[axis] = now_ms;
 
-    // Логируем всегда, когда логирование активно.
-    // Ограничение по частоте уже сделано выше (25 Гц).
-    if (!AP::logger().logging_started()) {
-        return;
-    }
-    
-    const uint8_t flags = (oscillating ? 0x01 : 0x00);
-    const float kP_eff = base_kP * scale;
+        if (!AP::logger().logging_started()) return;
 
-    const struct log_ESN pkt {
-        LOG_PACKET_HEADER_INIT(LOG_ESN_MSG),
-        time_us     : AP_HAL::micros64(),
-        axis        : axis,
-        flags       : flags,
-        scale       : scale,
-        base_kP     : base_kP,
-        kP_eff      : kP_eff,
-        rate_err    : rate_err,
-        hp_rate_err : hp_rate_err,
-        correction  : correction,
-        osc_freq    : osc_freq
-    };
-    AP::logger().WriteBlock(&pkt, sizeof(pkt));
-#endif
-}
+        const uint8_t flags = oscillating_P ? 0x01 : 0x00;
+        const float kP_eff = base_kP * scale_P;
+        const float kD_eff = base_kD * scale_D;
+
+        const struct log_ESN pkt {
+            LOG_PACKET_HEADER_INIT(LOG_ESN_MSG),
+            time_us      : AP_HAL::micros64(),
+            axis         : axis,
+            flags        : flags,
+            scale_P      : scale_P,
+            scale_D      : scale_D,
+            base_kP      : base_kP,
+            base_kD      : base_kD,
+            kP_eff       : kP_eff,
+            kD_eff       : kD_eff,
+            rate_err     : rate_err,
+            hp_rate_err  : hp_rate_err,
+            hp_gyro      : hp_gyro,
+            correction_P : correction_P,
+            osc_freq     : osc_freq
+        };
+        AP::logger().WriteBlock(&pkt, sizeof(pkt));
+    #endif
+    }
 #endif

@@ -116,9 +116,11 @@ protected:
 
     // Логирование скорректированных коэффициентов ESN
     // axis: 0 = roll, 1 = pitch
-    void log_esn_data(uint8_t axis, float scale, float base_kP,
-                      float rate_err, float hp_rate_err,
-                      float correction, float osc_freq, bool oscillating);
+    void log_esn_data(uint8_t axis,
+                    float scale_P, float scale_D,
+                    float base_kP, float base_kD,
+                    float rate_err, float hp_rate_err, float hp_gyro,
+                    float correction_P, float osc_freq, bool oscillating_P);
 #endif
 
 private:

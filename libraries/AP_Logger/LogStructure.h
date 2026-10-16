@@ -414,14 +414,18 @@ struct PACKED log_PID {
 struct PACKED log_ESN {
     LOG_PACKET_HEADER;
     uint64_t time_us;
-    uint8_t  axis;
-    uint8_t  flags;
-    float    scale;
+    uint8_t  axis;          // 0=roll, 1=pitch
+    uint8_t  flags;         // bit0=oscillating_P
+    float    scale_P;
+    float    scale_D;
     float    base_kP;
+    float    base_kD;
     float    kP_eff;
+    float    kD_eff;
     float    rate_err;
     float    hp_rate_err;
-    float    correction;
+    float    hp_gyro;
+    float    correction_P;
     float    osc_freq;
 };
 
