@@ -1,0 +1,8 @@
+tree ac1e945d10a390d04791cda3d19d114d109c3ac0
+parent e63fc0fe68636cf2ae16434e3419d3ac1a47b724
+author mich146@hotmail.com <mich146@hotmail.com@f9c3cf11-9bcb-44bc-f272-b75c42450872> 1312075460 +0000
+committer mich146@hotmail.com <mich146@hotmail.com@f9c3cf11-9bcb-44bc-f272-b75c42450872> 1312075460 +0000
+
+fix hil build
+
+git-svn-id: https://arducopter.googlecode.com/svn/trunk@2970 f9c3cf11-9bcb-44bc-f272-b75c42450872

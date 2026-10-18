@@ -1,0 +1,3 @@
+removed scaling on control in because it might cause rounding issues.
+
+git-svn-id: https://arducopter.googlecode.com/svn/trunk@2969 f9c3cf11-9bcb-44bc-f272-b75c42450872

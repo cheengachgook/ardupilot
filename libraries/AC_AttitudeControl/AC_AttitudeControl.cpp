@@ -3,6 +3,7 @@
 #include <AP_Vehicle/AP_Vehicle.h>
 #include <AP_Scheduler/AP_Scheduler.h>
 #include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <AP_Logger/AP_Logger.h>
 #if AP_ESNCONTROLLER_ENABLED
     #include <AP_ESNController/ESNController.h>
 #endif
@@ -280,12 +281,16 @@ void AC_AttitudeControl::reset_rate_controller_I_terms()
     get_rate_yaw_pid().reset_I();
     
     #if AP_ESNCONTROLLER_ENABLED
-        _esn_roll.reset();      // <-- было _esn.reset();
-        _esn_pitch.reset();     // <-- новый
-        _prev_roll_error = 0;
-        _prev_pitch_error = 0;
+        _esn_roll.reset();
+        _esn_pitch.reset();
+        _prev_roll_error = 0.0f;
+        _prev_pitch_error = 0.0f;
+        _filt_abs_err_roll = 0.0f;
+        _filt_abs_err_pitch = 0.0f;
+        _esn_train_div = 0;
+        _esn_pd_scale = Vector3f(1.0f, 1.0f, 1.0f);
     #endif
-}
+    }
 
 // reset rate controller I terms smoothly to zero in 0.5 seconds
 void AC_AttitudeControl::reset_rate_controller_I_terms_smoothly()
@@ -1033,123 +1038,268 @@ void AC_AttitudeControl::attitude_controller_run_quat()
     }
 
     
-    #if AP_ESNCONTROLLER_ENABLED
-        const float dt = _dt_s;
-        float roll_error  = attitude_error.x;
-        float pitch_error = attitude_error.y;
+             #if AP_ESNCONTROLLER_ENABLED
+        // ══════════════════════════════════════════════════════════════════
+        // ESN-адаптация rate PID (Умный поиск границы стабильности)
+        // ══════════════════════════════════════════════════════════════════
 
-        float d_roll_error  = (roll_error  - _prev_roll_error)  / dt;
-        float d_pitch_error = (pitch_error - _prev_pitch_error) / dt;
-        _prev_roll_error  = roll_error;
-        _prev_pitch_error = pitch_error;
+        if (!_motors.armed()) {
+            // === РЕЖИМ НАСТРОЙКИ НА ЗЕМЛЕ (НЕ ЗААРМЛЕН) ===
+            _base_kP_roll  = get_rate_roll_pid().kP();
+            _base_kP_pitch = get_rate_pitch_pid().kP();
+            _base_kD_roll  = get_rate_roll_pid().kD();
+            _base_kD_pitch = get_rate_pitch_pid().kD();
+            _base_kI_roll  = get_rate_roll_pid().kI();
+            _base_kI_pitch = get_rate_pitch_pid().kI();
 
-        // I-составляющие по обеим осям (симметрия!)
-        float roll_integral  = get_rate_roll_pid().get_pid_info().I;
-        float pitch_integral = get_rate_pitch_pid().get_pid_info().I;
+            _filt_abs_err_roll  = 0.0f;
+            _filt_abs_err_pitch = 0.0f;
+            _slow_err_roll      = 0.0f;
+            _slow_err_pitch     = 0.0f;
+            
+            // СБРОС НОВЫХ ПЕРЕМЕННЫХ
+            _safe_scale_roll    = 0.05f; // Начинаем с минимального потолка
+            _safe_scale_pitch   = 0.05f;
+            _prev_raw_err_roll  = 0.0f;
+            _prev_raw_err_pitch = 0.0f;
+            _zcr_roll           = 0;
+            _zcr_pitch          = 0;
 
-        // Фактические угловые скорости
-        float roll_rate  = gyro.x;
-        float pitch_rate = gyro.y;
-        float yaw_rate   = gyro.z;
-
-        // Целевые угловые скорости
-        float target_roll_rate  = _ang_vel_target_rads.x;
-        float target_pitch_rate = _ang_vel_target_rads.y;
-
-        // Воздушная скорость (с fallback на groundspeed)
-        float airspeed = 0.0f;
-        const AP_Airspeed &aspeed = AP::airspeed();
-        if (aspeed.healthy()) {
-            airspeed = aspeed.get_airspeed();
+            _esn_pd_scale       = Vector3f(1.0f, 1.0f, 1.0f);
+            _esn_train_div      = 0;
         } else {
-            airspeed = AP::ahrs().groundspeed();
+            // === РЕЖИМ ПОЛЕТА (ЗААРМЛЕН) ===
+            constexpr float _esn_train_div_max = 4.0f;
+            const Vector3f rate_error = _ang_vel_body_rads - gyro;
+
+            // 1. РЕФЛЕКС
+            if (fabsf(rate_error.x) > 5.0f) { _filt_abs_err_roll = 2.0f; }
+            if (fabsf(rate_error.y) > 5.0f) { _filt_abs_err_pitch = 2.0f; }
+
+            // 2. ЗАЩИТА ОТ НАСЫЩЕНИЯ
+            const float safe_rate_err_roll  = constrain_float(rate_error.x, -3.0f, 3.0f);
+            const float safe_rate_err_pitch = constrain_float(rate_error.y, -3.0f, 3.0f);
+
+            // БЫСТРЫЙ ФИЛЬТР
+            _filt_abs_err_roll  = 0.92f * _filt_abs_err_roll  + 0.08f * fabsf(safe_rate_err_roll);
+            _filt_abs_err_pitch = 0.92f * _filt_abs_err_pitch + 0.08f * fabsf(safe_rate_err_pitch);
+
+            // МЕДЛЕННЫЙ ФИЛЬТР
+            _slow_err_roll  = 0.995f * _slow_err_roll  + 0.005f * fabsf(safe_rate_err_roll);
+            _slow_err_pitch = 0.995f * _slow_err_pitch + 0.005f * fabsf(safe_rate_err_pitch);
+
+            // НОВОЕ: ДЕТЕКТОР СМЕНЫ ЗНАКА (Zero-Crossing Rate)
+            // НОВОЕ: ДЕТЕКТОР СМЕНЫ ЗНАКА (Zero-Crossing Rate) с мертвой зоной
+            constexpr float ZCR_DEADBAND = 0.05f; // Игнорируем шум меньше 0.05 rad/s
+
+            if (fabsf(rate_error.x) > ZCR_DEADBAND) {
+                if (rate_error.x * _prev_raw_err_roll < 0.0f) _zcr_roll++;
+            }
+            _prev_raw_err_roll = rate_error.x;
+            
+            if (fabsf(rate_error.y) > ZCR_DEADBAND) {
+                if (rate_error.y * _prev_raw_err_pitch < 0.0f) _zcr_pitch++;
+            }
+            _prev_raw_err_pitch = rate_error.y;
+
+            // 3. АДАПТИВНАЯ ЧАСТОТА ОБУЧЕНИЯ
+            bool do_train = (++_esn_train_div >= _esn_train_div_max);
+            if (do_train) _esn_train_div = 0;
+            if (fabsf(safe_rate_err_roll) > 2.0f || fabsf(safe_rate_err_pitch) > 2.0f) {
+                do_train = true; 
+            }
+
+            // 4. ПРИЗНАКИ (FEATURES)
+            const float roll_error_deg  = degrees(attitude_error.x);
+            const float pitch_error_deg = degrees(attitude_error.y);
+            const float d_roll_error    = (roll_error_deg  - _prev_roll_error)  / _dt_s;
+            const float d_pitch_error   = (pitch_error_deg - _prev_pitch_error) / _dt_s;
+            _prev_roll_error  = roll_error_deg;
+            _prev_pitch_error = pitch_error_deg;
+
+            float airspeed = 0.0f;
+            const AP_Airspeed &aspeed = AP::airspeed();
+            if (aspeed.healthy()) airspeed = aspeed.get_airspeed();
+            else airspeed = AP::ahrs().groundspeed();
+            
+            float alt = 0.0f;
+            _ahrs.get_relative_position_D_home(alt);
+
+            const float yaw_rate_deg = degrees(gyro.z);
+            const float I_roll  = get_rate_roll_pid().get_pid_info().I;
+            const float I_pitch = get_rate_pitch_pid().get_pid_info().I;
+
+            float features_roll[12] = {
+                roll_error_deg, d_roll_error, safe_rate_err_roll, I_roll,
+                _ang_vel_body_rads.x, gyro.x, pitch_error_deg, yaw_rate_deg,
+                airspeed, alt, _esn_pd_scale.x, _base_kP_roll
+            };
+
+            float features_pitch[12] = {
+                pitch_error_deg, d_pitch_error, safe_rate_err_pitch, I_pitch,
+                _ang_vel_body_rads.y, gyro.y, roll_error_deg, yaw_rate_deg,
+                airspeed, alt, _esn_pd_scale.y, _base_kP_pitch
+            };
+
+            // 5. UPDATE
+            float correction_roll  = _esn_roll.update(features_roll);
+            float correction_pitch = _esn_pitch.update(features_pitch);
+
+            correction_roll  = constrain_float(correction_roll,  -3.0f, 0.3f);
+            correction_pitch = constrain_float(correction_pitch, -3.0f, 0.3f);
+
+            float new_scale_roll  = expf(correction_roll);
+            float new_scale_pitch = expf(correction_pitch);
+
+            // Жесткие рамки масштаба: СВЕРХУ ОГРАНИЧЕНО ПОТОЛКОМ SAFE!
+            new_scale_roll  = constrain_float(new_scale_roll,  0.02f, _safe_scale_roll);
+            new_scale_pitch = constrain_float(new_scale_pitch, 0.02f, _safe_scale_pitch);
+
+            // Ограничитель скорости изменения
+            const float max_delta = 0.03f;
+            new_scale_roll  = constrain_float(new_scale_roll,  _esn_pd_scale.x - max_delta, _esn_pd_scale.x + max_delta);
+            new_scale_pitch = constrain_float(new_scale_pitch, _esn_pd_scale.y - max_delta, _esn_pd_scale.y + max_delta);
+
+            // РЕФЛЕКС
+            if (fabsf(rate_error.x) > 5.0f) {
+                new_scale_roll = 0.02f;
+                _safe_scale_roll = 0.05f; // Сбрасываем и потолок вниз
+            }
+            if (fabsf(rate_error.y) > 5.0f) {
+                new_scale_pitch = 0.02f;
+                _safe_scale_pitch = 0.05f;
+            }
+
+            _esn_pd_scale.x = new_scale_roll;
+            _esn_pd_scale.y = new_scale_pitch;
+            _esn_pd_scale.z = 1.0f;
+
+            // 6. РАЗДЕЛЬНОЕ ПРИМЕНЕНИЕ P, I, D
+            float p_out_roll  = _base_kP_roll  * new_scale_roll;
+            float i_out_roll  = _base_kI_roll  * new_scale_roll;
+            float d_out_roll  = MAX(_base_kD_roll  * new_scale_roll, 0.003f); 
+
+            float p_out_pitch = _base_kP_pitch * new_scale_pitch;
+            float i_out_pitch = _base_kI_pitch * new_scale_pitch;
+            float d_out_pitch = MAX(_base_kD_pitch * new_scale_pitch, 0.003f);
+
+            get_rate_roll_pid().kP().set(p_out_roll);
+            get_rate_roll_pid().kI().set(i_out_roll);
+            get_rate_roll_pid().kD().set(d_out_roll);
+
+            get_rate_pitch_pid().kP().set(p_out_pitch);
+            get_rate_pitch_pid().kI().set(i_out_pitch);
+            get_rate_pitch_pid().kD().set(d_out_pitch);
+
+            #if HAL_LOGGING_ENABLED
+            // 7. ЛОГИРОВАНИЕ (25 Гц)
+            static uint32_t esn_last_log_ms[2] = {0, 0};
+            const uint32_t now_ms = AP_HAL::millis();
+
+            if (now_ms - esn_last_log_ms[0] >= 40) {
+                esn_last_log_ms[0] = now_ms;
+                if (AP::logger().logging_started()) {
+                    const struct log_ESN pkt {
+                        LOG_PACKET_HEADER_INIT(LOG_ESN_MSG),
+                        time_us : AP_HAL::micros64(), axis : 0, 
+                        flags : (_filt_abs_err_roll > 0.05f) ? uint8_t(0x01) : uint8_t(0x00),
+                        scale_P : _esn_pd_scale.x, scale_D : _esn_pd_scale.x,
+                        base_kP : _base_kP_roll, base_kD : _base_kD_roll,
+                        kP_eff : p_out_roll, kD_eff : d_out_roll,
+                        rate_err : rate_error.x, hp_rate_err : _filt_abs_err_roll,
+                        hp_gyro : gyro.x, correction_P : correction_roll, osc_freq : 0.0f
+                    };
+                    AP::logger().WriteBlock(&pkt, sizeof(pkt));
+                }
+            }
+            if (now_ms - esn_last_log_ms[1] >= 40) {
+                esn_last_log_ms[1] = now_ms;
+                if (AP::logger().logging_started()) {
+                    const struct log_ESN pkt {
+                        LOG_PACKET_HEADER_INIT(LOG_ESN_MSG),
+                        time_us : AP_HAL::micros64(), axis : 1, 
+                        flags : (_filt_abs_err_pitch > 0.05f) ? uint8_t(0x01) : uint8_t(0x00),
+                        scale_P : _esn_pd_scale.y, scale_D : _esn_pd_scale.y,
+                        base_kP : _base_kP_pitch, base_kD : _base_kD_pitch,
+                        kP_eff : p_out_pitch, kD_eff : d_out_pitch,
+                        rate_err : rate_error.y, hp_rate_err : _filt_abs_err_pitch,
+                        hp_gyro : gyro.y, correction_P : correction_pitch, osc_freq : 0.0f
+                    };
+                    AP::logger().WriteBlock(&pkt, sizeof(pkt));
+                }
+            }
+            #endif
+
+            // 8. TRAIN (Умное обучение с детектором раскачки)
+            constexpr float ERR_OSC = 0.015f;     
+            constexpr float RELAX_GAIN = 0.02f;   
+            constexpr float CREEP_STEP = 0.03f * (_esn_train_div_max / 400); 
+
+            // Определяем: это вибрация или вялость?
+            bool is_osc_roll  = (_slow_err_roll > ERR_OSC) && (_zcr_roll > 5);
+            bool is_osc_pitch = (_slow_err_pitch > ERR_OSC) && (_zcr_pitch > 5);
+
+            if (do_train) {
+                float target_roll, target_pitch;
+
+                // --- ROLL ---
+                if (is_osc_roll) {
+                    target_roll = -3.0f; 
+                    _safe_scale_roll *= 0.7f; // РЕЗКО СРЕЗАЕМ ПОТОЛОК ПРИ ВИБРАЦИИ
+                } else {
+                    target_roll = RELAX_GAIN * (_safe_scale_roll - _esn_pd_scale.x);
+                }
+                _safe_scale_roll = constrain_float(_safe_scale_roll, 0.02f, 1.0f);
+                target_roll = constrain_float(target_roll, -3.0f, 0.3f);
+
+                // --- PITCH ---
+                if (is_osc_pitch) {
+                    target_pitch = -3.0f;
+                    _safe_scale_pitch *= 0.7f;
+                } else {
+                    target_pitch = RELAX_GAIN * (_safe_scale_pitch - _esn_pd_scale.y);
+                }
+                _safe_scale_pitch = constrain_float(_safe_scale_pitch, 0.02f, 1.0f);
+                target_pitch = constrain_float(target_pitch, -3.0f, 0.3f);
+
+                _esn_roll.train(target_roll);
+                _esn_pitch.train(target_pitch);
+            }
+
+             // 9. ПОИСК ПОТОЛКА И ЗАТУХАНИЕ СЧЕТЧИКА (10 Гц)
+            static uint32_t last_creep_ms = 0;
+            if (AP_HAL::millis() - last_creep_ms >= 100) { 
+                last_creep_ms = AP_HAL::millis();
+                
+                // 1. Затухание счетчиков
+                if (_slow_err_roll < (ERR_OSC * 0.2f)) _zcr_roll = 0;
+                if (_slow_err_pitch < (ERR_OSC * 0.2f)) _zcr_pitch = 0;
+                _zcr_roll = (_zcr_roll > 2) ? (_zcr_roll - 2) : 0;
+                _zcr_pitch = (_zcr_pitch > 2) ? (_zcr_pitch - 2) : 0;
+
+                // 2. Умный рост потолка (Только при нехватке мощности!)
+                // Если НЕТ раскачки (!is_osc) И ошибка умеренная (вялость), 
+                // значит нам не хватает P, и мы осторожно поднимаем потолок.
+                if (!is_osc_roll && _slow_err_roll > (ERR_OSC * 0.5f)) {
+                    _safe_scale_roll += CREEP_STEP; 
+                }
+                if (!is_osc_pitch && _slow_err_pitch > (ERR_OSC * 0.5f)) {
+                    _safe_scale_pitch += CREEP_STEP;
+                }
+                
+                // В остальных случаях (идеальная тишина) safe просто замирает на месте.
+            }
+
+            // 10. ДИАГНОСТИКА (printf раз в секунду)
+            static uint32_t esn_dbg_ms = 0;
+            if (AP_HAL::millis() - esn_dbg_ms >= 1000) {
+                esn_dbg_ms = AP_HAL::millis();
+                hal.console->printf(
+                    "ESN: roll err=%.2f sc=%.2f safe=%.2f zcr=%d | pitch err=%.2f sc=%.2f safe=%.2f zcr=%d\n",
+                    (double)_filt_abs_err_roll, (double)new_scale_roll, (double)_safe_scale_roll, (int)_zcr_roll,
+                    (double)_filt_abs_err_pitch, (double)new_scale_pitch, (double)_safe_scale_pitch, (int)_zcr_pitch);
+            }
         }
-        if (!is_positive(airspeed)) {
-            airspeed = AP::ahrs().groundspeed();
-        }
-
-        // Высота относительно home
-        float alt = 0.0f;
-        _ahrs.get_relative_position_D_home(alt);
-
-        // Газ и общий угол ошибки ориентации
-        float throttle = _motors.get_throttle();
-        float thrust_err_angle = _thrust_error_angle_rad;
-
-        // ─── Вектор из 12 признаков для ESN по КРЕНУ ───
-        float features_roll[12] = {
-            roll_error,           // 1. своя ошибка
-            d_roll_error,         // 2. своя производная
-            roll_integral,        // 3. свой интеграл
-            roll_rate,            // 4. своя фактическая скорость
-            target_roll_rate,     // 5. своя целевая скорость
-            pitch_error,          // 6. соседняя ошибка (контекст)
-            pitch_rate,           // 7. соседняя скорость (контекст)
-            yaw_rate,             // 8. рыскание (связь осей)
-            airspeed,             // 9. воздушная скорость
-            alt,                  // 10. высота
-            throttle,             // 11. газ
-            thrust_err_angle      // 12. общий угол ошибки ориентации
-        };
-
-        float correction_roll = _esn_roll.update(features_roll);
-        correction_roll = constrain_float(correction_roll, -6.0f, 0.5f);
-        float scale_roll = expf(correction_roll);
-        scale_roll = constrain_float(scale_roll, 0.01f, 1.65f);
-
-        // ─── Вектор из 12 признаков для ESN по ТАНГАЖУ ───
-        float features_pitch[12] = {
-            pitch_error,          // 1. своя ошибка
-            d_pitch_error,        // 2. своя производная
-            pitch_integral,       // 3. свой интеграл
-            pitch_rate,           // 4. своя фактическая скорость
-            target_pitch_rate,    // 5. своя целевая скорость
-            roll_error,           // 6. соседняя ошибка (контекст)
-            roll_rate,            // 7. соседняя скорость (контекст)
-            yaw_rate,             // 8. рыскание (связь осей)
-            airspeed,             // 9. воздушная скорость
-            alt,                  // 10. высота
-            throttle,             // 11. газ
-            thrust_err_angle      // 12. общий угол ошибки ориентации
-        };
-
-        float correction_pitch = _esn_pitch.update(features_pitch);
-        correction_pitch = constrain_float(correction_pitch, -6.0f, 0.5f);
-        float scale_pitch = expf(correction_pitch);
-        scale_pitch = constrain_float(scale_pitch, 0.01f, 1.65f);
-
-        // ─── Применение масштабов ───
-        _esn_pd_scale.x = scale_roll;
-        _esn_pd_scale.y = scale_pitch;
-        _esn_pd_scale.z = 1.0f;      // yaw не трогаем
-
-        _pd_scale = VECTORF_111;
-        set_PD_scale_mult(_esn_pd_scale);
-
-        // ─── Диагностика (~4 Гц) ───
-        static uint16_t esn_log_counter = 0;
-        if (++esn_log_counter >= 100) {
-            esn_log_counter = 0;
-            float eff_roll_P  = get_rate_roll_pid().kP()  * _esn_pd_scale.x;
-            float eff_pitch_P = get_rate_pitch_pid().kP() * _esn_pd_scale.y;
-            hal.console->printf("ESN: roll(sc=%.3f, effP=%.4f) pitch(sc=%.3f, effP=%.4f)\n",
-                                scale_roll, eff_roll_P, scale_pitch, eff_pitch_P);
-        }
-
-        // ─── Обучение каждой сети на своей ошибке скорости ───
-        Vector3f rate_error = _ang_vel_target_rads - gyro;
-
-        static float filtered_abs_roll_err  = 0.0f;
-        static float filtered_abs_pitch_err = 0.0f;
-
-        filtered_abs_roll_err  = 0.92f * filtered_abs_roll_err  + 0.08f * fabsf(rate_error.x);
-        filtered_abs_pitch_err = 0.92f * filtered_abs_pitch_err + 0.08f * fabsf(rate_error.y);
-
-        float target_correction_roll  = -2.0f * filtered_abs_roll_err;
-        float target_correction_pitch = -2.0f * filtered_abs_pitch_err;
-
-        _esn_roll.train(target_correction_roll);
-        _esn_pitch.train(target_correction_pitch);
     #endif
     
     // Record error to handle EKF resets
@@ -1682,19 +1832,31 @@ void AC_AttitudeControl::get_rpy_srate(float &roll_srate, float &pitch_srate, fl
 #if AP_ESNCONTROLLER_ENABLED
 void AC_AttitudeControl::esn_init()
 {
-    // два независимых экземпляра ESN с одинаковыми гиперпараметрами
-    // 12 входов, 70 нейронов (пропорционально росту размерности)
     _esn_roll.init(12, 70, 0.9f, 0.1f, 0.01f, 1e-6f, 0.99f);
     _esn_pitch.init(12, 70, 0.9f, 0.1f, 0.01f, 1e-6f, 0.99f);
 
     _prev_roll_error = 0.0f;
     _prev_pitch_error = 0.0f;
+    _filt_abs_err_roll = 0.0f;
+    _filt_abs_err_pitch = 0.0f;
+    _esn_train_div = 0;
+    _slow_err_roll = 0.0f;
+    _slow_err_pitch = 0.0f;
 
     _base_kP_roll  = get_rate_roll_pid().kP();
     _base_kP_pitch = get_rate_pitch_pid().kP();
-    _base_kP_yaw   = get_rate_yaw_pid().kP();
+    _base_kD_roll  = get_rate_roll_pid().kD();
+    _base_kD_pitch = get_rate_pitch_pid().kD();
+    _base_kI_roll  = get_rate_roll_pid().kI();
+    _base_kI_pitch = get_rate_pitch_pid().kI();
 
     _esn_pd_scale = Vector3f(1.0f, 1.0f, 1.0f);
-    set_PD_scale_mult(_esn_pd_scale);
+    
+    _safe_scale_roll = 0.05f;
+    _safe_scale_pitch = 0.05f;
+    _prev_raw_err_roll = 0.0f;
+    _prev_raw_err_pitch = 0.0f;
+    _zcr_roll = 0;
+    _zcr_pitch = 0;
 }
 #endif
