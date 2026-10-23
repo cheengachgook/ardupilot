@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+
+<initialize name="reset_template">
+  <ubody unit="FT/SEC">    0.0  </ubody>
+  <vbody unit="FT/SEC">    0.0  </vbody>
+  <wbody unit="FT/SEC">    0.0  </wbody>
+  <latitude unit="DEG">    %(LATITUDE)s  </latitude>
+  <longitude unit="DEG">  %(LONGITUDE)s  </longitude>
+  <phi unit="DEG">         0.0  </phi>
+  <theta unit="DEG">       0.0  </theta>
+  <psi unit="DEG">        %(HEADING)s  </psi>
+  <altitude unit="FT">     5.5  </altitude>
+  <trim>2</trim>
+  <running> -1 </running>
+</initialize>

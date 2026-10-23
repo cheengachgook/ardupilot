@@ -4,10 +4,25 @@
 #ifndef AP_ESNCONTROLLER_ENABLED
   #define AP_ESNCONTROLLER_ENABLED 1 //по умолчанию включено
 #endif
-/*param set ATC_RAT_RLL_P 1.5
-param set ATC_RAT_PIT_P 1.5
-param set ATC_RAT_RLL_D 0.02
-param set ATC_RAT_PIT_D 0.02
-param set ATC_RATE_R_MAX 500
-param set ATC_RATE_P_MAX 500
-param set ATC_ANGLE_MAX 600*/
+/*
+rc 1 1900
+rc 1 1100
+rc 1 1900
+rc 1 1500
+
+param set SERVO_RATE 10
+param set RLL_RATE_FF 0.0
+param set PTCH_RATE_FF 0.0
+param set RLL_RATE_D 0.1
+param set PTCH_RATE_D 0.1
+param set RLL_RATE_P 10.5
+param set PTCH_RATE_P 10.0
+param set RLL_RATE_I 0.0
+param set PTCH_RATE_I 0.0
+param set RLL_RATE_SMAX 0
+param set PTCH_RATE_SMAX 0
+param set RLL_RATE_FLTE 0
+param set PTCH_RATE_FLTE 0
+param set PTCH2SRV_TCONST 0.06
+param set RLL2SRV_TCONST 0.06
+param set SIM_CG_OFFSET_X -0.15*/

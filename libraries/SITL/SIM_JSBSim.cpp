@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h> // Для strcmp
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -91,6 +92,10 @@ bool JSBSim::create_templates(void)
     if (f == nullptr) {
         AP_HAL::panic("Unable to create jsbsim script %s", jsbsim_script);
     }
+    
+    // Проверяем, является ли модель Cessna 310 (двухмоторный)
+    bool is_c310 = (strcmp(jsbsim_model, "c310") == 0);
+
     fprintf(f,
 "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
 "<?xml-stylesheet type=\"text/xsl\" href=\"http://jsbsim.sf.net/JSBSimScript.xsl\"?>\n"
@@ -114,6 +119,7 @@ bool JSBSim::create_templates(void)
 "    <event name=\"start engine\">\n"
 "      <condition> simulation/sim-time-sec le 0.01 </condition>\n"
 "      <set name=\"propulsion/engine[0]/set-running\" value=\"1\"/>\n"
+"      %s\n" // Сюда добавляется второй двигатель только для C310
 "      <notify/>\n"
 "    </event>\n"
 "\n"
@@ -130,7 +136,9 @@ bool JSBSim::create_templates(void)
             jsbsim_model,
             jsbsim_model,
             control_port,
-            1.0/rate_hz);
+            1.0/rate_hz,
+            is_c310 ? "      <set name=\"propulsion/engine[1]/set-running\" value=\"1\"/>\n" : ""
+            );
     fclose(f);
 
     f = fopen(jsbsim_fgout, "w");
@@ -365,21 +373,96 @@ void JSBSim::send_servos(const struct sitl_input &input)
         rudder   = (ch2+ch1)/2.0f;
     }
     float wind_speed_fps = input.wind.speed / FEET_TO_METERS;
-    asprintf(&buf,
-             "set fcs/aileron-cmd-norm %f\n"
-             "set fcs/elevator-cmd-norm %f\n"
-             "set fcs/rudder-cmd-norm %f\n"
-             "set fcs/throttle-cmd-norm %f\n"
-             "set atmosphere/psiw-rad %f\n"
-             "set atmosphere/wind-mag-fps %f\n"
-             "set atmosphere/turbulence/milspec/windspeed_at_20ft_AGL-fps %f\n"
-             "set atmosphere/turbulence/milspec/severity %f\n"
-             "iterate 1\n",
-             aileron, elevator, rudder, throttle,
-             radians(input.wind.direction),
-             wind_speed_fps,
-             wind_speed_fps/3,
-             input.wind.turbulence);
+    bool is_c310 = (strcmp(jsbsim_model, "c310") == 0);
+    
+    if (!hal.util->get_soft_armed()) {
+        // === РЕЖИМ DISARMED (Самолет на земле, двигатель заглушен) ===
+        if (is_c310) {
+            asprintf(&buf,
+                     "set fcs/aileron-cmd-norm %f\n"
+                     "set fcs/elevator-cmd-norm %f\n"
+                     "set fcs/rudder-cmd-norm %f\n"
+                     "set fcs/throttle-cmd-norm[0] 0.0\n"
+                     "set fcs/throttle-cmd-norm[1] 0.0\n"
+                     "set propulsion/starter_cmd 0\n"
+                     "set propulsion/magneto_cmd 0\n"
+                     "set fcs/mixture-cmd-norm[0] 0.0\n"
+                     "set fcs/mixture-cmd-norm[1] 0.0\n"
+                     "set fcs/advance-cmd-norm[0] 0.0\n"
+                     "set fcs/advance-cmd-norm[1] 0.0\n"
+                     "set atmosphere/psiw-rad %f\n"
+                     "set atmosphere/wind-mag-fps %f\n"
+                     "set atmosphere/turbulence/milspec/windspeed_at_20ft_AGL-fps %f\n"
+                     "set atmosphere/turbulence/milspec/severity %f\n"
+                     "iterate 1\n",
+                     aileron, elevator, rudder,
+                     radians(input.wind.direction),
+                     wind_speed_fps,
+                     wind_speed_fps/3,
+                     input.wind.turbulence);
+        } else {
+            // Универсальные команды (Rascal, X8)
+            asprintf(&buf,
+                     "set fcs/aileron-cmd-norm %f\n"
+                     "set fcs/elevator-cmd-norm %f\n"
+                     "set fcs/rudder-cmd-norm %f\n"
+                     "set fcs/throttle-cmd-norm 0.0\n"
+                     "set atmosphere/psiw-rad %f\n"
+                     "set atmosphere/wind-mag-fps %f\n"
+                     "set atmosphere/turbulence/milspec/windspeed_at_20ft_AGL-fps %f\n"
+                     "set atmosphere/turbulence/milspec/severity %f\n"
+                     "iterate 1\n",
+                     aileron, elevator, rudder,
+                     radians(input.wind.direction),
+                     wind_speed_fps,
+                     wind_speed_fps/3,
+                     input.wind.turbulence);
+        }
+    } else {
+        // === РЕЖИМ ARMED (Двигатель работает, самолет готов лететь) ===
+        if (is_c310) {
+            asprintf(&buf,
+                     "set fcs/aileron-cmd-norm %f\n"
+                     "set fcs/elevator-cmd-norm %f\n"
+                     "set fcs/rudder-cmd-norm %f\n"
+                     "set fcs/throttle-cmd-norm[0] %f\n"
+                     "set fcs/throttle-cmd-norm[1] %f\n"
+                     "set propulsion/starter_cmd 1\n"
+                     "set propulsion/magneto_cmd 3\n"
+                     "set fcs/mixture-cmd-norm[0] 1.0\n"
+                     "set fcs/mixture-cmd-norm[1] 1.0\n"
+                     "set fcs/advance-cmd-norm[0] 1.0\n"
+                     "set fcs/advance-cmd-norm[1] 1.0\n"
+                     "set atmosphere/psiw-rad %f\n"
+                     "set atmosphere/wind-mag-fps %f\n"
+                     "set atmosphere/turbulence/milspec/windspeed_at_20ft_AGL-fps %f\n"
+                     "set atmosphere/turbulence/milspec/severity %f\n"
+                     "iterate 1\n",
+                     aileron, elevator, rudder, throttle, throttle,
+                     radians(input.wind.direction),
+                     wind_speed_fps,
+                     wind_speed_fps/3,
+                     input.wind.turbulence);
+        } else {
+            // Универсальные команды (Rascal, X8)
+            asprintf(&buf,
+                     "set fcs/aileron-cmd-norm %f\n"
+                     "set fcs/elevator-cmd-norm %f\n"
+                     "set fcs/rudder-cmd-norm %f\n"
+                     "set fcs/throttle-cmd-norm %f\n"
+                     "set atmosphere/psiw-rad %f\n"
+                     "set atmosphere/wind-mag-fps %f\n"
+                     "set atmosphere/turbulence/milspec/windspeed_at_20ft_AGL-fps %f\n"
+                     "set atmosphere/turbulence/milspec/severity %f\n"
+                     "iterate 1\n",
+                     aileron, elevator, rudder, throttle,
+                     radians(input.wind.direction),
+                     wind_speed_fps,
+                     wind_speed_fps/3,
+                     input.wind.turbulence);
+        }
+    }
+
     ssize_t buflen = strlen(buf);
     ssize_t sent = sock_control.send(buf, buflen);
     free(buf);

@@ -74,33 +74,18 @@ public:
         }
         
         #if AP_ESNCONTROLLER_ENABLED
-            ESNController _esn_roll;
-            ESNController _esn_pitch;
-
-            float _prev_roll_error = 0.0f;
-            float _prev_pitch_error = 0.0f;
-            float _slow_err_roll = 0.0f;
-            float _slow_err_pitch = 0.0f;
-            float _base_kP_roll = 0.0f;
-            float _base_kP_pitch = 0.0f;
-            float _base_kD_roll = 0.0f;
-            float _base_kD_pitch = 0.0f;
-            float _base_kI_roll = 0.0f;
-            float _base_kI_pitch = 0.0f;
-            float _safe_scale_roll = 1.0f;
-            float _safe_scale_pitch = 1.0f;
-            uint16_t _zcr_roll = 0;   // Счетчик смены знака
-            uint16_t _zcr_pitch = 0;
-            float _prev_raw_err_roll = 0.0f;
-            float _prev_raw_err_pitch = 0.0f;
-            Vector3f _esn_pd_scale{1.0f, 1.0f, 1.0f};
-
-            // Состояние детектора/обучения (persistent между вызовами)
-            float _filt_abs_err_roll = 0.0f;
-            float _filt_abs_err_pitch = 0.0f;
-            uint16_t _esn_train_div = 0;
+            #include <AP_ESNController/ESNController.h>
+            ESNController _esn_roll;      // <-- было ESNController _esn;
+            ESNController _esn_pitch;     // <-- новый экземпляр
+            float _prev_roll_error;
+            float _prev_pitch_error;
+            float _base_kP_roll;
+            float _base_kP_pitch;
+            float _base_kP_yaw;
+            Vector3f _esn_pd_scale;
 
             void esn_init();
+            void esn_reset();
         #endif
 
     static AC_AttitudeControl *get_singleton(void) {

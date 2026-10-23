@@ -436,31 +436,7 @@ const struct LogStructure Copter::log_structure[] = {
 
     { LOG_PARAMTUNE_MSG, sizeof(log_PTUN),
       "PTUN", "QBffff",         "TimeUS,Param,TunVal,TunMin,TunMax,NIn", "s#----", "F-----" },
-      
-    // @LoggerMessage: ESN
-    // @Description: Echo State Network adaptive PID scaling
-    // @Field: TimeUS: Time since system startup
-    // @Field: Ax: Axis (0=roll, 1=pitch)
-    // @Field: Fl: Flags (bit0=oscillation detected)
-    // @Field: ScP: Scale applied to P gain
-    // @Field: ScD: Scale applied to D gain (same as ScP in Copter)
-    // @Field: bKP: Base kP before scaling
-    // @Field: bKD: Base kD before scaling
-    // @Field: kPe: Effective kP after scaling
-    // @Field: kDe: Effective kD after scaling
-    // @Field: RErr: Rate error (target - measured), rad/s
-    // @Field: HP: Filtered abs rate error
-    // @Field: HGy: Gyro reading, rad/s
-    // @Field: RCor: Raw network correction (before expf)
-    // @Field: OHz: Oscillation frequency estimate (Hz), 0 in Copter
-    
-    { LOG_ESN_MSG, sizeof(log_ESN),
-      "ESN", "QBBfffffffffff",
-      "TimeUS,Ax,Fl,ScP,ScD,bKP,bKD,kPe,kDe,RErr,HP,HGy,RCor,OHz",
-      "s#--kk-------z",
-      "F-------------",
-      true,
-    },
+
 // @LoggerMessage: CTUN
 // @Description: Control Tuning information
 // @Field: TimeUS: Time since system startup

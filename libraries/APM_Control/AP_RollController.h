@@ -49,6 +49,14 @@ protected:
     float _prev_hp_gyro = 0.0f;
     float _filtered_indicator_gyro = 0.0f;
 
+    float _filt_abs_err_roll = 0.0f;
+    float _prev_raw_err = 0.0f;
+    uint16_t _zcr = 0;
+    float _safe_scale_P = 1.0f;
+    float _safe_scale_D = 1.0f;
+    float _sluggish_mult = 1.0f;
+    float _filt_vib = 0.0f; 
+    
     // ── Троттлинг обучения ──
     // train() вызывается раз в _ESN_TRAIN_DIVIDER тактов.
     // При 400 Гц и делителе 8 → 50 Гц обучения.
