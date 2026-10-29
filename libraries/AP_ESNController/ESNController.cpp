@@ -1,5 +1,7 @@
 #include "ESNController.h"
+#include <AP_Math/AP_Math.h>
 #include <cstdlib>
+#include <cstdio>
 #include <ctime>
 
 // Префикс ESN_ будет автоматически добавлен родительским классом
@@ -48,6 +50,8 @@ void ESNController::free_buffers() {
     delete[] _new_P;             _new_P = nullptr;
     delete[] _eig_vec;           _eig_vec = nullptr;
     delete[] _eig_new_vec;       _eig_new_vec = nullptr;
+    delete[] gain;               gain = nullptr;
+    delete[] bias;               bias = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +81,8 @@ void ESNController::alloc_buffers() {
     _new_P             = new float[ext_size * ext_size];
     _eig_vec           = new float[n_reservoir];
     _eig_new_vec       = new float[n_reservoir];
+    gain               = new float[n_reservoir];
+    bias               = new float[n_reservoir];
 }
 
 void ESNController::init(uint8_t _n_inputs, uint8_t _n_reservoir,
@@ -108,6 +114,11 @@ void ESNController::init(uint8_t _n_inputs, uint8_t _n_reservoir,
     for (uint8_t i = 0; i < n_inputs; i++) {
         input_mean[i] = 0.0f;
         input_std[i] = 1.0f;
+    }
+
+    for (uint8_t i = 0; i < n_reservoir; i++) {
+        gain[i] = 1.0f;   // начальный gain
+        bias[i] = 0.0f;   // начальный bias
     }
 }
 
@@ -216,7 +227,7 @@ void ESNController::compute_new_state(const float* u_norm) {
         for (uint8_t j = 0; j < n_inputs; j++) {
             sum += W_in[i * n_inputs + j] * u_norm[j];
         }
-        float activation = tanhf(sum);
+        float activation = tanhf(gain[i] * sum + bias[i]);
         state[i] = (1 - leak_rate) * state[i] + leak_rate * activation;
     }
 }
@@ -327,6 +338,146 @@ void ESNController::train(float target) {
     }
 
     memcpy(P, _new_P, ext_size * ext_size * sizeof(float));
+}
+
+// ---------------------------------------------------------------------------
+// Предобучение сети
+// ---------------------------------------------------------------------------
+void ESNController::pretrain(const float* data, uint16_t num_samples, 
+                             float eta, float mu, float sigma, uint8_t epochs)
+{
+    if (data == nullptr || num_samples == 0) {
+        return;
+    }
+
+    // Буфер для нормализованных входов (можно использовать _u_norm, но лучше локальный)
+    float* u_norm = new float[n_inputs];
+
+    for (uint8_t epoch = 0; epoch < epochs; epoch++) {
+        // Сбрасываем состояние резервуара перед каждой эпохой
+        memset(state, 0, n_reservoir * sizeof(float));
+
+        for (uint16_t s = 0; s < num_samples; s++) {
+            const float* u = &data[s * n_inputs];
+
+            // 1. Нормализация входа (используем существующую функцию)
+            normalize(u, u_norm);
+
+            // 2. Вычисление нового состояния с текущими gain/bias
+            //    (аналогично compute_new_state, но без обновления state до конца)
+            float* input_part = new float[n_reservoir];
+            float* reservoir_part = new float[n_reservoir];
+            for (uint8_t i = 0; i < n_reservoir; i++) {
+                float sum_in = 0;
+                for (uint8_t j = 0; j < n_inputs; j++) {
+                    sum_in += W_in[i * n_inputs + j] * u_norm[j];
+                }
+                float sum_res = 0;
+                for (uint8_t j = 0; j < n_reservoir; j++) {
+                    sum_res += W_res[i * n_reservoir + j] * state[j];
+                }
+                input_part[i] = sum_in;
+                reservoir_part[i] = sum_res;
+            }
+
+            // 3. IP-обновление gain/bias для каждого нейрона
+            for (uint8_t i = 0; i < n_reservoir; i++) {
+                // Взвешенная сумма до активации
+                float x = input_part[i] + reservoir_part[i];
+                // Выход нейрона (tanh)
+                float y = tanhf(gain[i] * x + bias[i]);
+
+                // Формулы для tanh (гауссово распределение)
+                // Δb = -η * [ -μ/σ² + (y/σ²)*(2σ² + 1 - y² + μ*y) ]
+                // Δa = η/a + Δb * x
+                float inv_sigma2 = 1.0f / (sigma * sigma);
+                float term = -mu * inv_sigma2 + (y * inv_sigma2) * (2.0f * sigma * sigma + 1.0f - y * y + mu * y);
+                float delta_b = -eta * term;
+                float delta_a = eta / gain[i] + delta_b * x;
+
+                // Обновляем параметры
+                bias[i] += delta_b;
+                gain[i] += delta_a;
+
+                // Ограничиваем gain, чтобы избежать численных проблем
+                gain[i] = constrain_float(gain[i], 0.1f, 5.0f);
+
+                // 4. Обновляем состояние резервуара с новым gain/bias
+                float new_activation = tanhf(gain[i] * x + bias[i]);
+                state[i] = (1.0f - leak_rate) * state[i] + leak_rate * new_activation;
+            }
+
+            delete[] input_part;
+            delete[] reservoir_part;
+        }
+    }
+
+    delete[] u_norm;
+
+    // После предобучения сбрасываем выходные веса и RLS,
+    // так как динамика резервуара изменилась.
+    memset(W_out, 0, (n_reservoir + n_inputs) * sizeof(float));
+    init_rls();
+
+    // Сбрасываем состояние, чтобы начать с чистого листа
+    memset(state, 0, n_reservoir * sizeof(float));
+    memset(extended_state, 0, (n_reservoir + n_inputs) * sizeof(float));
+}
+
+// ---------------------------------------------------------------------------
+// Считывание входных данных для предобучения сети
+// ---------------------------------------------------------------------------
+uint16_t ESNController::load_pretrain_data(const char* filename, float** out_data)
+{
+    FILE* f = fopen(filename, "r");
+    if (!f) {
+        return 0;
+    }
+
+    char line[512];
+    // Пропускаем заголовок
+    if (!fgets(line, sizeof(line), f)) {
+        fclose(f);
+        return 0;
+    }
+
+    // Первый проход: считаем строки
+    uint16_t count = 0;
+    while (fgets(line, sizeof(line), f)) {
+        count++;
+    }
+    rewind(f);
+    if (fgets(line, sizeof(line), f) == nullptr) {
+        fclose(f);
+        return 0;
+    }
+
+    // Выделяем память под данные: count * n_inputs
+    float* data = new float[count * n_inputs];
+    uint16_t idx = 0;
+
+    while (fgets(line, sizeof(line), f) && idx < count) {
+        // Формат: time_us, f0, f1, ...
+        char* token = strtok(line, ",");
+        if (!token) continue;
+        // Пропускаем time_us
+        token = strtok(NULL, ",");
+        uint8_t fidx = 0;
+        while (token && fidx < n_inputs) {
+            data[idx * n_inputs + fidx] = atof(token);
+            token = strtok(NULL, ",");
+            fidx++;
+        }
+        // Если признаков меньше n_inputs, дополняем нулями
+        while (fidx < n_inputs) {
+            data[idx * n_inputs + fidx++] = 0.0f;
+        }
+        idx++;
+    }
+
+    fclose(f);
+    *out_data = data;
+    return idx;
 }
 
 // ---------------------------------------------------------------------------

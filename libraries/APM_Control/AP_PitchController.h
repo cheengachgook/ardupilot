@@ -52,7 +52,8 @@ protected:
     float _safe_scale_D = 1.0f;
     float _sluggish_mult = 1.0f;
     float _filt_vib = 0.0f; 
-    
+    bool _pio_detected = false;
+    float _base_kI = 0.0f;
     // ── Троттлинг обучения ──
     // train() вызывается раз в _ESN_TRAIN_DIVIDER тактов.
     // При 400 Гц и делителе 8 → 50 Гц обучения.

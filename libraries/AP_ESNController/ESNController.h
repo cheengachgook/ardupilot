@@ -59,6 +59,10 @@ public:
     float update(const float* u);
     void train(float target);
     void reset();
+    void pretrain(const float* data, uint16_t num_samples, 
+                  float eta = 0.001f, float mu = 0.0f, float sigma = 1.0f, 
+                  uint8_t epochs = 1);
+    uint16_t load_pretrain_data(const char* filename, float** out_data);
 
     // ─── AP_Param интерфейс ───
     static const struct AP_Param::GroupInfo var_info[];
@@ -76,6 +80,8 @@ private:
     float noise_level;
     float regularization;
     float lambda;
+    float* gain;
+    float* bias;
 
     // ─── Параметры, доступные из GCS ───
     AP_Int16  cfg_reservoir_size;
