@@ -58,6 +58,15 @@ protected:
     float _filt_vib = 0.0f; 
     bool _pio_detected = false;
     float _base_kI = 0.0f;
+
+    // Адаптивный лимит угловой скорости
+    float _adaptive_rate_limit = 0.0f;       // 0 = отключен
+    float _adaptive_rate_limit_hold = 0.0f;  // Фиксированное значение после остановки PIO
+    uint32_t _last_rate_reduction_ms = 0;
+    bool _maneuver_in_progress = false;
+    int8_t _desired_dir = 0;           // Текущее направление (1, -1, 0)
+    uint32_t _desired_dir_since_ms = 0; // Когда началось
+    
     // ── Троттлинг обучения ──
     // train() вызывается раз в _ESN_TRAIN_DIVIDER тактов.
     // При 400 Гц и делителе 8 → 50 Гц обучения.

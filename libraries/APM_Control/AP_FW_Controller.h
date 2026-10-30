@@ -69,6 +69,7 @@ protected:
     AC_PID rate_pid;
     float angle_err_deg;
     float ff_scale = 1.0;
+    float _last_unclamped_desired_rate = 0.0f;
 
     AP_PIDInfo _pid_info;
 

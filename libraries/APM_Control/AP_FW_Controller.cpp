@@ -65,6 +65,9 @@ float AP_FW_Controller::run_angle_control(int32_t desired_angle_cd, float scaler
         reset_input_shaping_deg(desired_angle_deg, desired_rate_degs);
         desired_rate_degs += get_rate_target_offset_degs();
 
+        // Сохраняем ЗАПРОШЕННУЮ скорость до лимита
+        _last_unclamped_desired_rate = desired_rate_degs;
+
         if (should_apply_rate_limits()) {
             desired_rate_degs = rate_limit_degs(desired_rate_degs);
         }
@@ -99,7 +102,12 @@ float AP_FW_Controller::run_angle_control(int32_t desired_angle_cd, float scaler
     }
 
     float desired_rate_degs = sqrt_controller(angle_err_deg, angle_gain, accel_max * 0.5, dt);
-    desired_rate_degs = rate_limit_degs(desired_rate_degs + rate_target_degs + get_rate_target_offset_degs());
+    desired_rate_degs = desired_rate_degs + rate_target_degs + get_rate_target_offset_degs();
+
+    // Сохраняем ЗАПРОШЕННУЮ скорость до лимита
+    _last_unclamped_desired_rate = desired_rate_degs;
+
+    desired_rate_degs = rate_limit_degs(desired_rate_degs);
 
     return run_axis_rate_control(desired_rate_degs, scaler, disable_integrator, ground_mode);
 }
@@ -149,8 +157,8 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler, 
     static uint16_t esn_dbg_cnt = 0;
     if (++esn_dbg_cnt >= 50) {
         esn_dbg_cnt = 0;
-        hal.console->printf("ESN: rate_err=%.2f desired=%.1f actual=%.1f\n",
-                            rate_err_degs, desired_rate_degs, degrees(rate_rads));
+        hal.console->printf("ESN: rate_err=%.2f desired=%.1f unclamped=%.1f actual=%.1f\n",
+                            rate_err_degs, desired_rate_degs, _last_unclamped_desired_rate, degrees(rate_rads));
     }
 #endif
 
@@ -195,6 +203,9 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler, 
 float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler)
 {
     angle_err_deg = 0.0;
+
+    // Сохраняем ЗАПРОШЕННУЮ скорость до shaping и лимитов
+    _last_unclamped_desired_rate = desired_rate_degs;
 
     if (!should_apply_input_shaping()) {
         reset_input_shaping_deg(get_measured_angle_deg(), desired_rate_degs);
@@ -276,6 +287,7 @@ void AP_FW_Controller::reset()
     rate_pid.reset_I();
     rate_pid.reset_filter();
     _last_out = 0.0;
+    _last_unclamped_desired_rate = 0.0f;
     reset_input_shaping_deg(get_measured_angle_deg(), degrees(get_measured_rate_rads()));
 }
 
